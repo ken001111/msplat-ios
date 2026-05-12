@@ -126,7 +126,18 @@ struct ContentView: View {
     @State private var iterations: Int = 200
 
     private var datasetPath: String? {
-        Bundle.main.url(forResource: "Scan_recent", withExtension: nil)?.path
+        let bundle = Bundle.main
+        // Folder-reference case (Xcode "Create folder references" radio).
+        if let url = bundle.url(forResource: "Scan_recent", withExtension: nil),
+           FileManager.default.fileExists(atPath: url.appendingPathComponent("transforms.json").path) {
+            return url.path
+        }
+        // Fallback for Xcode 26's "Create synchronized folders" / flattened layout —
+        // find transforms.json wherever it landed and use its parent as the dataset.
+        if let tx = bundle.url(forResource: "transforms", withExtension: "json") {
+            return tx.deletingLastPathComponent().path
+        }
+        return nil
     }
 
     var body: some View {
