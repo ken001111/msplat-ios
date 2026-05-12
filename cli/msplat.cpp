@@ -145,6 +145,11 @@ int main(int argc, char *argv[]) {
     app.add_option("--mesh-trunc-voxels", meshTruncMultiplier,
         "TSDF truncation distance in voxel widths (default 4)");
 
+    // Phase 2c.3 + 2c.4: Marching Cubes mesh export.
+    std::string exportMesh;
+    app.add_option("--export-mesh", exportMesh,
+        "Run TSDF fusion + Marching Cubes, write triangle-mesh PLY (Phase 2c.3+4)");
+
     // Phase 2b.3.2 (6/N) smoke hook: load a PLY (3DGS or 2DGS) and render the
     // first training camera with msplat_render, then exit. Reports min/max/mean
     // and nonzero counts on out_img + the 2DGS side outputs (out_depth /
@@ -287,8 +292,8 @@ int main(int argc, char *argv[]) {
                       << " in " << pc_s << "s" << std::endl;
         }
 
-        // Phase 2c.1: voxel grid sizing (no fusion yet — that's 2c.2).
-        if (meshInfo || !exportTSDF.empty()) {
+        // Phase 2c.1/2/3/4: voxel-grid setup, TSDF fusion, MC mesh export.
+        if (meshInfo || !exportTSDF.empty() || !exportMesh.empty()) {
             auto grid = model.makeVoxelGrid(cams, meshVoxelSize, meshBound);
             int64_t numVoxels = (int64_t)grid.dims[0] * grid.dims[1] * grid.dims[2];
             std::cout << "\n=== Voxel grid (Phase 2c.1) ===" << std::endl;
@@ -304,8 +309,9 @@ int main(int argc, char *argv[]) {
             std::cout << "  buffer:      " << (numVoxels * 2 * 4) / (1024 * 1024)
                       << " MB (Float32 sdf + weight)" << std::endl;
 
-            // Phase 2c.2: TSDF fusion + raw dump.
-            if (!exportTSDF.empty()) {
+            // 2c.2/3/4: fuse if either TSDF dump or mesh export is requested.
+            bool needFusion = !exportTSDF.empty() || !exportMesh.empty();
+            if (needFusion) {
                 float truncDist = meshTruncMultiplier * meshVoxelSize;
                 std::cout << "Fusing " << cams.size() << " views (trunc=" << truncDist
                           << " m, alphaThresh=" << meshAlphaThresh << ")..." << std::endl;
@@ -314,8 +320,10 @@ int main(int argc, char *argv[]) {
                 auto t1 = std::chrono::high_resolution_clock::now();
                 double s = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() / 1000.0;
                 std::cout << "Fusion done in " << s << "s" << std::endl;
+            }
 
-                // Read grid back to CPU + write raw dump.
+            // Phase 2c.2 — raw TSDF dump.
+            if (!exportTSDF.empty()) {
                 msplat_gpu_sync();
                 MTensor cpu = grid.data.cpu();
                 std::ofstream f(exportTSDF, std::ios::binary);
@@ -325,13 +333,22 @@ int main(int argc, char *argv[]) {
 
                 // Diagnostic: count how many voxels got at least one observation.
                 const float *p = cpu.data<float>();
-                int64_t observed = 0, sign_change = 0;
+                int64_t observed = 0;
                 for (int64_t i = 0; i < numVoxels; i++) {
-                    float w = p[i*2 + 1];
-                    if (w > 0) observed++;
+                    if (p[i*2 + 1] > 0) observed++;
                 }
                 std::cout << "Voxels observed (weight > 0): " << observed << " / " << numVoxels
                           << " (" << (100.0 * observed / numVoxels) << "%)" << std::endl;
+            }
+
+            // Phase 2c.3 + 2c.4 — Marching Cubes mesh export.
+            if (!exportMesh.empty()) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                int64_t nTri = model.extractMesh(grid, exportMesh);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double s = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() / 1000.0;
+                std::cout << "Marching Cubes done in " << s << "s — "
+                          << nTri << " triangles → " << exportMesh << std::endl;
             }
         }
 

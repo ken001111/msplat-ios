@@ -67,6 +67,13 @@ struct Model{
   // voxels of trust band on either side of each surface sample).
   void integrateTSDF(VoxelGrid &grid, std::vector<Camera> &cameras,
                       int step, float truncDist, float alphaThresh);
+
+  // Phase 2c.3 + 2c.4: extract a triangle mesh from a fused voxel grid
+  // via Marching Cubes and save as PLY. maxTriangles caps the output
+  // buffer (default 4M tris ≈ 144 MB worst case). Returns number of
+  // triangles written.
+  int64_t extractMesh(const VoxelGrid &grid, const std::string &outPath,
+                       int maxTriangles = 4'000'000);
   int loadCheckpoint(const std::string &filename);
   struct CamSetup {
     float fx, fy, cx, cy;

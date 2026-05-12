@@ -676,6 +676,44 @@ Model::VoxelGrid Model::makeVoxelGrid(const std::vector<Camera> &cameras,
     return g;
 }
 
+// Phase 2c.3 + 2c.4: Marching Cubes on the voxel grid → non-indexed triangle
+// PLY. Vertices are not deduplicated across cells; each triangle owns its
+// 3 vertices. PLY format: binary little-endian, with `vertex` element (xyz)
+// + `face` element (uchar count, int indices). The face list is the trivial
+// 0,1,2 ; 3,4,5 ; ... since vertices aren't shared.
+int64_t Model::extractMesh(const VoxelGrid &grid, const std::string &outPath,
+                            int maxTriangles) {
+    std::vector<float> tris;
+    int64_t nTri = msplat_marching_cubes(
+        const_cast<MTensor&>(grid.data),
+        grid.dims[0], grid.dims[1], grid.dims[2],
+        grid.origin[0], grid.origin[1], grid.origin[2],
+        grid.voxelSize,
+        maxTriangles, tris);
+
+    int64_t nVerts = nTri * 3;
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out.is_open()) throw std::runtime_error("Cannot open " + outPath);
+    out << "ply\nformat binary_little_endian 1.0\n";
+    out << "comment msplat 2c.3 Marching Cubes mesh (non-indexed)\n";
+    out << "element vertex " << nVerts << "\n";
+    out << "property float x\nproperty float y\nproperty float z\n";
+    out << "element face " << nTri << "\n";
+    out << "property list uchar int vertex_indices\n";
+    out << "end_header\n";
+    out.write(reinterpret_cast<const char*>(tris.data()), nTri * 9 * sizeof(float));
+    // Trivial face list: each triangle gets its own 3 vertices in order.
+    for (int64_t i = 0; i < nTri; i++) {
+        uint8_t n = 3;
+        int32_t a = (int32_t)(i*3 + 0), b = (int32_t)(i*3 + 1), c = (int32_t)(i*3 + 2);
+        out.write(reinterpret_cast<const char*>(&n), 1);
+        out.write(reinterpret_cast<const char*>(&a), 4);
+        out.write(reinterpret_cast<const char*>(&b), 4);
+        out.write(reinterpret_cast<const char*>(&c), 4);
+    }
+    return nTri;
+}
+
 // Phase 2c.2: fuse each rendered camera into the voxel grid in-place.
 void Model::integrateTSDF(VoxelGrid &grid, std::vector<Camera> &cameras,
                           int step, float truncDist, float alphaThresh) {

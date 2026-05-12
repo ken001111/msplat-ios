@@ -139,6 +139,8 @@ struct MetalContext {
     id<MTLComputePipelineState> loss_l1_distortion_2dgs_kernel_cpso;
     // TSDF fusion (Phase 2c.2)
     id<MTLComputePipelineState> tsdf_integrate_kernel_cpso;
+    // Marching Cubes (Phase 2c.3)
+    id<MTLComputePipelineState> marching_cubes_kernel_cpso;
     // Tile-local sorting (shared with densify)
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     // Prefix sum (shared with densify)
@@ -236,6 +238,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->loss_l1_distortion_2dgs_kernel_cpso      = load(@"loss_l1_distortion_2dgs_kernel");
     // TSDF fusion (Phase 2c.2).
     ctx->tsdf_integrate_kernel_cpso               = load(@"tsdf_integrate_kernel");
+    // Marching Cubes (Phase 2c.3).
+    ctx->marching_cubes_kernel_cpso               = load(@"marching_cubes_kernel");
     // Tile-local sorting + prefix sum (shared with densify)
     ctx->scatter_to_prealloc_bins_kernel_cpso     = load(@"scatter_to_prealloc_bins_kernel");
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
@@ -710,6 +714,60 @@ MTensor msplat_last_out_normal()       { return g_tcache.out_normal; }
 MTensor msplat_last_out_alpha()        { return g_tcache.out_alpha; }
 MTensor msplat_last_out_median_depth() { return g_tcache.out_median_depth; }
 MTensor msplat_last_out_distortion()   { return g_tcache.out_distortion; }
+
+// Phase 2c.3: Marching Cubes on a TSDF voxel grid.
+int64_t msplat_marching_cubes(
+    MTensor &grid,
+    int Dx, int Dy, int Dz,
+    float origin_x, float origin_y, float origin_z,
+    float voxelSize,
+    int maxTriangles,
+    std::vector<float> &triangles
+) {
+    MetalContext* ctx = get_global_context();
+    id<MTLDevice> device = ctx->device;
+
+    // Output buffers: triangle vertex data + atomic counter.
+    MTensor tris_out = mtensor_empty(device, {(int64_t)maxTriangles * 9}, DType::Float32);
+    MTensor tri_count = mtensor_empty(device, {1}, DType::Int32);
+
+    auto dims_arr   = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
+        (uint32_t)Dx, (uint32_t)Dy, (uint32_t)Dz, 0xDEAD});
+    auto origin_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{
+        origin_x, origin_y, origin_z, 0.0f});  // 16-byte float3 padding
+    uint32_t maxT = (uint32_t)maxTriangles;
+
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        // Zero the atomic counter.
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit fillBuffer:tri_count.buffer() range:NSMakeRange(0, tri_count.nbytes()) value:0];
+        [blit endEncoding];
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx->marching_cubes_kernel_cpso];
+        [enc setBytes:dims_arr->data()   length:sizeof(*dims_arr)   atIndex:0];
+        [enc setBytes:origin_arr->data() length:sizeof(*origin_arr) atIndex:1];
+        ENC_SCALAR(enc, voxelSize, 2);
+        ENC_BUF(enc, grid, 3);
+        ENC_SCALAR(enc, maxT, 4);
+        ENC_BUF(enc, tri_count, 5);
+        ENC_BUF(enc, tris_out, 6);
+        // One thread per cell. Cells run from (0,0,0) to (Dx-2, Dy-2, Dz-2).
+        MTLSize tg = MTLSizeMake(8, 8, 4);
+        MTLSize grid_size = MTLSizeMake(Dx - 1, Dy - 1, Dz - 1);
+        [enc dispatchThreads:grid_size threadsPerThreadgroup:tg];
+        [enc endEncoding];
+    });
+    ctx->syncCB();
+
+    // Read back triangle count and clip if it exceeded maxTriangles.
+    int32_t emitted = *tri_count.data<int32_t>();
+    int32_t written = std::min(emitted, (int32_t)maxTriangles);
+    triangles.assign(tris_out.data<float>(),
+                     tris_out.data<float>() + (size_t)written * 9);
+    return written;
+}
 
 // Phase 2c.2: integrate one camera's rendered depth+alpha into the TSDF
 // voxel grid. Synchronous so the caller can loop sequentially over cameras

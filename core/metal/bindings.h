@@ -58,6 +58,19 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
     MTensor &gt, int features_rest_bases,
     float lambda_l1, float lambda_dist);
 
+// Phase 2c.3: Marching Cubes on a TSDF voxel grid. Allocates output buffers
+// internally based on `maxTriangles`, dispatches the kernel, reads back the
+// emitted triangle count + vertex data. Returns the number of triangles
+// written (capped at maxTriangles). Vertex data is xyz triples, 3 per
+// triangle, in world space.
+int64_t msplat_marching_cubes(
+    MTensor &grid,                   // [Dz, Dy, Dx, 2] Float32 sdf+weight
+    int Dx, int Dy, int Dz,
+    float origin_x, float origin_y, float origin_z,
+    float voxelSize,
+    int maxTriangles,                // output buffer cap
+    std::vector<float> &triangles);  // OUT: (Ntri × 9) world-space vertex coords
+
 // Phase 2c.2: integrate one rendered depth+alpha map into the TSDF voxel grid.
 // One Metal thread per voxel; the dispatch is synchronous so multiple calls
 // can be chained for multi-camera fusion without atomics.
