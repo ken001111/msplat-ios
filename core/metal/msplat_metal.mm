@@ -320,28 +320,18 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 // this eliminates all per-iteration GPU allocations.
 struct FusedTensorCache {
     int fwd_num_points = 0, capacity = 0, img_height = 0, img_width = 0, num_tiles = 0;
-    int bwd_num_points = 0, features_rest_bases = 0;
 
-    // Forward intermediates
-    MTensor xys, depths, radii_out, conics, num_tiles_hit, colors, aabb;
-    MTensor gaussian_ids;
-    MTensor packed_xy_opac, packed_conic, packed_rgb;
-    MTensor out_img, final_Ts, final_idx;
-    MTensor loss_intermediates;
-    MTensor ssim_h_buf;
-    MTensor tile_bins, loss_sum;
-
-    // 2DGS forward intermediates (Phase 2b.3.1) — sit alongside the 3DGS
-    // buffers; allocated unconditionally so either path can dispatch without
-    // a second ensure_forward pass. The 3DGS `conics`/`packed_xy_opac`/
-    // `packed_conic` buffers are simply unused when the 2DGS dispatch runs.
+    // 2DGS forward intermediates. per-gaussian, per-sorted-surfel, per-pixel.
+    MTensor xys, depths, radii_out, num_tiles_hit, colors, aabb;
     MTensor transMats, normal_opacity;                            // per-gaussian
-    MTensor packed_xy, packed_transmat, packed_normal_opac;       // per sorted-surfel
-    MTensor out_depth, out_normal;                                // per pixel
+    MTensor gaussian_ids;
+    MTensor packed_xy, packed_transmat, packed_normal_opac, packed_rgb;  // per sorted-surfel
+    MTensor out_img, final_Ts, final_idx, out_depth, out_normal;  // per pixel
 
-    // Tile-local sorting buffers
+    // Tile-local sorting buffers (shared with densify)
+    MTensor tile_bins;
     MTensor tile_offsets, tile_scatter_counters;
-    MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64 — pre-allocated per-tile bins
+    MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64
 
     // Multi-threadgroup prefix sum temp buffer
     MTensor block_totals;
@@ -350,17 +340,6 @@ struct FusedTensorCache {
     MTensor overflow_flag;
     int64_t capacity_multiplier = 16;
 
-    // Depth-chunked rasterization buffers
-    uint32_t current_K_max = 1;
-    int chunk_K_max = 0;
-    MTensor chunk_T, chunk_C, chunk_final_idx;
-    MTensor prefix_T, after_C;
-
-    // Backward gradient accumulators
-    MTensor v_rendered;
-    MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
-    MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
-
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
         if (np != fwd_num_points) {
@@ -368,23 +347,17 @@ struct FusedTensorCache {
             xys = mtensor_empty(dev, {np, 2}, DType::Float32);
             depths = mtensor_empty(dev, {np}, DType::Float32);
             radii_out = mtensor_empty(dev, {np}, DType::Int32);
-            conics = mtensor_empty(dev, {np, 3}, DType::Float32);
             num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
-            // 2DGS per-gaussian outputs from project_and_sh_forward_2dgs_kernel.
             transMats = mtensor_empty(dev, {np, 9}, DType::Float32);
             normal_opacity = mtensor_empty(dev, {np, 4}, DType::Float32);
         }
         if (cap != capacity) {
             capacity = cap;
             gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
-            packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            // 2DGS sorted-surfel pack, written by bitonic_sort_per_tile_2dgs_kernel
-            // and consumed by nd_rasterize_forward_2dgs_kernel.
             packed_xy = mtensor_empty(dev, {cap, 2}, DType::Float32);
             packed_transmat = mtensor_empty(dev, {cap, 9}, DType::Float32);
             packed_normal_opac = mtensor_empty(dev, {cap, 4}, DType::Float32);
@@ -394,10 +367,6 @@ struct FusedTensorCache {
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
-            loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
-            // 2DGS per-pixel side outputs from nd_rasterize_forward_2dgs_kernel.
             out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
             out_normal = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
         }
@@ -408,38 +377,8 @@ struct FusedTensorCache {
             tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
             prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
         }
-        if (!loss_sum.defined()) {
-            loss_sum = mtensor_empty(dev, {1}, DType::Float32);
-        }
         if (!overflow_flag.defined()) {
             overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
-        }
-    }
-
-    void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
-        if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
-        chunk_K_max = K;
-        chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
-        chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-        chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
-        prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
-        after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-    }
-
-    void ensure_backward(int np, int frb, id<MTLDevice> dev) {
-        if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
-            bwd_num_points = np;
-            features_rest_bases = frb;
-            v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
-            v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_opacity = mtensor_empty(dev, {np, 1}, DType::Float32);
-            v_depth = mtensor_empty(dev, {np}, DType::Float32);
-            v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
-            v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
         }
     }
 };
