@@ -187,6 +187,138 @@ inline void scale_rot_to_cov3d(
     cov3d[5] = tmp[2][2];
 }
 
+// ===== 2DGS surfel helpers (Phase 2b.3.1) =====
+// Port of hbb1/2d-gaussian-splatting CUDA helpers in
+//   submodules/diff-surfel-rasterization/cuda_rasterizer/{auxiliary.h,forward.cu}.
+// In 2DGS each gaussian is a flat disc on a tangent plane (Huang et al. 2024).
+// Per-gaussian state: scale is float2 (in-plane radii), quat defines the tangent
+// frame (columns: tangent_u, tangent_v, normal). The forward projection writes
+// a 3x3 homography T mapping homogeneous pixel coords → homogeneous tangent uv
+// coords, so the rasterizer can recover (u, v, depth) in a few FMAs per pixel.
+
+// Low-pass filter cutoff (matches forward.cu FilterSize = sqrt(2)/2).
+constant float FILTER_SIZE_2DGS = 0.707106f;
+// 1 / FilterSize^2 — pre-inverted (matches forward.cu FilterInvSquare = 2.0).
+constant float FILTER_INV_SQ_2DGS = 2.0f;
+
+// Compute the 3x3 homography T that maps (u, v, 1) in the surfel tangent
+// frame → (px*w, py*w, w) in homogeneous pixel coords. Also returns the
+// surfel normal in world space.
+//
+// Storage convention: T is returned as 3 row-vectors (one per math row).
+// row 0 is the "px*w" linear functional, row 1 is "py*w", row 2 is "w".
+// The forward kernel writes these three rows into the conics buffer
+// sequentially as 9 floats per gaussian. The rasterizer reads them back
+// to construct two homogeneous planes (k = px*row2 - row0, l = py*row2 -
+// row1) whose intersection gives (u, v) via Eq. 8-10 of the paper.
+//
+// msplat stores projmat as a flat row-major float[16].
+inline void compute_transmat_2dgs(
+    const float3 p_orig,
+    const float2 scale_2d,          // linear-space radii (caller has already exp'd if log-space)
+    const float glob_scale,
+    const float4 quat,
+    constant float* projmat,        // 4x4 row-major: world → clip
+    const float W,
+    const float H,
+    const float cx,                 // principal point x (pixels)
+    const float cy,                 // principal point y (pixels)
+    thread float3& out_T_row0,
+    thread float3& out_T_row1,
+    thread float3& out_T_row2,
+    thread float3& out_normal_world
+) {
+    // Tangent frame in world space, scaled by per-axis surfel radii.
+    float3x3 R = quat_to_rotmat(quat);
+    float3 tu = R[0] * (scale_2d.x * glob_scale);    // scaled tangent_u (3-vec, world dir)
+    float3 tv = R[1] * (scale_2d.y * glob_scale);    // scaled tangent_v
+    out_normal_world = R[2];                          // unit normal
+
+    // Project tu, tv (directions, w=0) and p_orig (point, w=1) to clip space.
+    // projmat is row-major: row i has indices [4*i .. 4*i+3].
+    float4 tu_clip = float4(
+        projmat[0]*tu.x + projmat[1]*tu.y + projmat[2]*tu.z,
+        projmat[4]*tu.x + projmat[5]*tu.y + projmat[6]*tu.z,
+        projmat[8]*tu.x + projmat[9]*tu.y + projmat[10]*tu.z,
+        projmat[12]*tu.x + projmat[13]*tu.y + projmat[14]*tu.z
+    );
+    float4 tv_clip = float4(
+        projmat[0]*tv.x + projmat[1]*tv.y + projmat[2]*tv.z,
+        projmat[4]*tv.x + projmat[5]*tv.y + projmat[6]*tv.z,
+        projmat[8]*tv.x + projmat[9]*tv.y + projmat[10]*tv.z,
+        projmat[12]*tv.x + projmat[13]*tv.y + projmat[14]*tv.z
+    );
+    float4 p_clip = float4(
+        projmat[0]*p_orig.x + projmat[1]*p_orig.y + projmat[2]*p_orig.z + projmat[3],
+        projmat[4]*p_orig.x + projmat[5]*p_orig.y + projmat[6]*p_orig.z + projmat[7],
+        projmat[8]*p_orig.x + projmat[9]*p_orig.y + projmat[10]*p_orig.z + projmat[11],
+        projmat[12]*p_orig.x + projmat[13]*p_orig.y + projmat[14]*p_orig.z + projmat[15]
+    );
+
+    // NDC → homogeneous pixel: pixhomog = (0.5*W*c.x + (cx-0.5)*c.w,
+    //                                       0.5*H*c.y + (cy-0.5)*c.w,
+    //                                       c.w).
+    // (The -0.5 offset matches msplat's existing ndc2pix() helper.)
+    float halfW = 0.5f * W;
+    float halfH = 0.5f * H;
+    float bx = cx - 0.5f;
+    float by = cy - 0.5f;
+
+    float3 col_u = float3(halfW*tu_clip.x + bx*tu_clip.w,
+                          halfH*tu_clip.y + by*tu_clip.w,
+                          tu_clip.w);
+    float3 col_v = float3(halfW*tv_clip.x + bx*tv_clip.w,
+                          halfH*tv_clip.y + by*tv_clip.w,
+                          tv_clip.w);
+    float3 col_o = float3(halfW*p_clip.x  + bx*p_clip.w,
+                          halfH*p_clip.y  + by*p_clip.w,
+                          p_clip.w);
+
+    // Math T satisfies T · (u, v, 1) = (px*w, py*w, w) componentwise.
+    //   row 0: linear functional yielding px*w
+    //   row 1: yielding py*w
+    //   row 2: yielding w
+    // row_i = (col_u.<i>, col_v.<i>, col_o.<i>) for i in {x, y, z}.
+    out_T_row0 = float3(col_u.x, col_v.x, col_o.x);
+    out_T_row1 = float3(col_u.y, col_v.y, col_o.y);
+    out_T_row2 = float3(col_u.z, col_v.z, col_o.z);
+}
+
+// Screen-space AABB of a 2DGS surfel given its T matrix (as 3 rows).
+// Mirrors compute_aabb in hbb1's forward.cu — solves the ellipse equation
+// s^T (T_row0_T_row0 + T_row1_T_row1 - cutoff^2 T_row2_T_row2) s = 0 in
+// closed form to get the screen-space center and per-axis half-extent.
+// Returns false if the surfel is degenerate (zero w-row).
+inline bool compute_aabb_2dgs(
+    const float3 T_row0,
+    const float3 T_row1,
+    const float3 T_row2,
+    const float cutoff,
+    thread float2& out_point_image,
+    thread float2& out_extent
+) {
+    // t = (k², k², -1)  where k = cutoff
+    float3 t = float3(cutoff * cutoff, cutoff * cutoff, -1.0f);
+    float d = dot(t, T_row2 * T_row2);
+    if (d == 0.0f) return false;
+    float3 f = (1.0f / d) * t;
+
+    float2 p = float2(
+        dot(f, T_row0 * T_row2),
+        dot(f, T_row1 * T_row2)
+    );
+
+    float2 h0 = p * p - float2(
+        dot(f, T_row0 * T_row0),
+        dot(f, T_row1 * T_row1)
+    );
+
+    float2 h = sqrt(max(float2(1e-4f, 1e-4f), h0));
+    out_point_image = p;
+    out_extent = h;
+    return true;
+}
+
 // Project 3D covariance to 2D via EWA splatting.
 // Takes pre-computed view-space position; exploits J sparsity (5/9 nonzero).
 float3 project_cov3d_ewa(
@@ -1777,6 +1909,125 @@ kernel void project_and_sh_forward_kernel(
     aabb[idx * 2 + 1] = aabb_y;
 
     // SH: compute colors for non-culled gaussians (reuse p_world from registers)
+    float3 viewdir = normalize(p_world - cam_pos);
+    const uint num_channels = 3;
+    uint num_bases = num_sh_bases(degree);
+    uint dc_idx = num_channels * idx;
+    uint rest_idx = (num_bases - 1) * num_channels * idx;
+    uint idx_col = num_channels * idx;
+    sh_coeffs_to_color(degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
+}
+
+// ===== 2DGS forward projection (Phase 2b.3.1) =====
+// Port of hbb1/2d-gaussian-splatting preprocessCUDA (forward.cu:148–251).
+// Reads float2 scales (in-plane radii), constructs the 3x3 homography
+// T_pix2uv, writes its 9 floats to the transMats buffer (replaces the 3-float
+// conics buffer of the 3DGS path), and emits a per-surfel float4
+// normal_opacity (world-space normal + raw opacity).
+//
+// Not yet dispatched — sits next to the 3DGS kernel until the rasterizer,
+// host-side buffer allocators, and PLY format are flipped over.
+kernel void project_and_sh_forward_2dgs_kernel(
+    // Projection args
+    constant int& num_points,
+    constant float* means3d,         // float3 per gaussian
+    constant float* scales,          // float2 per gaussian (in-plane radii, log-space)
+    constant float& glob_scale,
+    constant float* quats,           // float4 per gaussian (tangent-frame rotation)
+    constant float* viewmat,         // 4x4 row-major
+    constant float* projmat,         // 4x4 row-major (world → clip)
+    constant float4& intrins,        // (fx, fy, cx, cy)
+    constant uint2& img_size,
+    constant uint3& tile_bounds,
+    constant float& clip_thresh,
+    device float* xys,               // float2 per gaussian — screen-space surfel center
+    device float* depths,            // view-space z of surfel center (sorting key)
+    device int* radii,
+    device float* transMats,         // 9 floats per gaussian (3 rows of T)
+    device int32_t* num_tiles_hit,
+    device float* normal_opacity,    // float4 per gaussian: (n.x, n.y, n.z, opacity_raw)
+    constant float* opacities_raw,   // float per gaussian (logit-space; passed through to normal_opacity.w)
+    // SH args (same as 3DGS path)
+    constant uint& degree,
+    constant uint& degrees_to_use,
+    constant float3& cam_pos,
+    constant float* features_dc,
+    constant float* features_rest,
+    device float* colors,
+    device float* aabb,              // float2 per gaussian — per-axis pixel extent
+    uint3 gp [[thread_position_in_grid]]
+) {
+    uint idx = gp.x;
+    if (idx >= (uint)num_points) {
+        return;
+    }
+    radii[idx] = 0;
+    num_tiles_hit[idx] = 0;
+
+    float3 p_world = read_packed_float3(means3d, idx);
+    float3 p_view;
+    if (clip_near_plane(p_world, viewmat, p_view, clip_thresh)) {
+        return;
+    }
+
+    // 2DGS state: scales is float2 in log-space; quat defines the tangent frame
+    float2 s_log = read_packed_float2(scales, idx);
+    float2 scale_2d = exp(s_log);
+    float4 quat = read_packed_float4(quats, idx);
+
+    // Compute homography T (3 rows) and the surfel normal.
+    float3 T_row0, T_row1, T_row2;
+    float3 normal_world;
+    compute_transmat_2dgs(
+        p_world, scale_2d, glob_scale, quat, projmat,
+        (float)img_size.x, (float)img_size.y, intrins.z, intrins.w,
+        T_row0, T_row1, T_row2, normal_world
+    );
+
+    // Screen-space center + extent from compute_aabb (3-sigma cutoff).
+    const float cutoff = 3.0f;
+    float2 center;
+    float2 extent;
+    if (!compute_aabb_2dgs(T_row0, T_row1, T_row2, cutoff, center, extent)) {
+        return;
+    }
+    // Low-pass filter floor on radius (matches forward.cu line 230).
+    float radius = ceil(max(max(extent.x, extent.y), cutoff * FILTER_SIZE_2DGS));
+
+    // Tile binding (same as 3DGS path).
+    uint2 tile_min, tile_max;
+    get_tile_bbox(center, float2(radius, radius), (int3)tile_bounds, tile_min, tile_max);
+    int32_t tile_area = (tile_max.x - tile_min.x) * (tile_max.y - tile_min.y);
+    if (tile_area <= 0) {
+        return;
+    }
+
+    // Write per-surfel state.
+    num_tiles_hit[idx] = tile_area;
+    depths[idx] = p_view.z;
+    radii[idx] = (int)radius;
+    write_packed_float2(xys, idx, center);
+    aabb[idx * 2]     = radius;
+    aabb[idx * 2 + 1] = radius;
+
+    // Write T as 3 rows × 3 floats = 9 floats per gaussian.
+    // Layout matches hbb1's transMats: [row0.x, row0.y, row0.z, row1.x, ..., row2.z]
+    // so the rasterizer reads contiguous float3s as the two homogeneous planes.
+    uint t_base = idx * 9;
+    transMats[t_base + 0] = T_row0.x;
+    transMats[t_base + 1] = T_row0.y;
+    transMats[t_base + 2] = T_row0.z;
+    transMats[t_base + 3] = T_row1.x;
+    transMats[t_base + 4] = T_row1.y;
+    transMats[t_base + 5] = T_row1.z;
+    transMats[t_base + 6] = T_row2.x;
+    transMats[t_base + 7] = T_row2.y;
+    transMats[t_base + 8] = T_row2.z;
+
+    // Pack world-space normal + raw opacity (matches hbb1's normal_opacity output).
+    write_packed_float4(normal_opacity, idx, float4(normal_world, opacities_raw[idx]));
+
+    // SH evaluation — identical to the 3DGS path (color model is unchanged in 2DGS).
     float3 viewdir = normalize(p_world - cam_pos);
     const uint num_channels = 3;
     uint num_bases = num_sh_bases(degree);
