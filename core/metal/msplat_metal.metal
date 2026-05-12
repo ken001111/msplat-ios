@@ -1561,6 +1561,280 @@ kernel void bitonic_sort_per_tile_2dgs_kernel(
     }
 }
 
+// ===== 2DGS rasterize backward (M2.2) =====
+// Per-pixel reverse traversal of the same surfels that contributed in the
+// forward pass. Re-derives alpha (same arithmetic as forward), then computes
+// VJPs for transMat / mean2D / normal3D / opacity / RGB and atomically
+// scatters them to per-gaussian gradient buffers.
+//
+// Port of hbb1/2d-gaussian-splatting backward.cu:renderCUDA (lines 144-446).
+// MSL 3.0 atomic_fetch_add_explicit on `device atomic<float>*` provides the
+// equivalent of CUDA atomicAdd. Apple GPU family 7+ (M1 / A14+) — well within
+// our target (iPad Pro M2, iPhone 14 Pro A16).
+//
+// Dead code until M2.5 wires the dispatcher. Loaded eagerly at startup so any
+// kernel-creation error surfaces at init rather than first backward call.
+kernel void nd_rasterize_backward_2dgs_kernel(
+    constant uint3& tile_bounds,
+    constant uint3& img_size,
+    constant int* tile_bins,                          // int2 (start, end) per tile
+    constant int* gaussian_ids,                       // sorted point list — maps sorted_idx -> global gaussian id
+    constant float* packed_xy,                        // float2 per sorted-surfel
+    constant float* packed_normal_opac,               // float4 per sorted-surfel (n.xyz, sigmoid(opac))
+    constant float* packed_transmat,                  // 9 floats per sorted-surfel
+    constant float* packed_rgb,                       // float3 per sorted-surfel (raw SH, pre +0.5 clamp)
+    constant float* final_Ts,                         // float3 per pixel (T_final, M1, M2)
+    constant int* final_index,                        // int2 per pixel (last_contributor, median_contributor)
+    constant float* background,                       // float3
+    // upstream gradients
+    constant float* dL_dout_img,                      // float3 per pixel
+    constant float* dL_dout_depth,                    // float per pixel
+    constant float* dL_dout_alpha,                    // float per pixel
+    constant float* dL_dout_normal,                   // float3 per pixel
+    constant float* dL_dout_median_depth,             // float per pixel
+    constant float* dL_dout_distortion,               // float per pixel
+    // outputs (atomic accumulators, sized per-gaussian)
+    device atomic<float>* dL_dtransMat,               // [N, 9]
+    device atomic<float>* dL_dmean2D,                 // [N, 2]
+    device atomic<float>* dL_dnormal3D,               // [N, 3]
+    device atomic<float>* dL_dopacity,                // [N, 1]
+    device atomic<float>* dL_dcolors,                 // [N, 3]
+    constant uint2& blockDim,
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    float px = (float)j;
+    float py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int rounds = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+    int toDo = range.y - range.x;
+
+    // Threadgroup-shared per-surfel state for one reverse-batch.
+    threadgroup int   collected_id[RAST_BLOCK_SIZE];
+    threadgroup float2 collected_xy[RAST_BLOCK_SIZE];
+    threadgroup float4 collected_normal_opac[RAST_BLOCK_SIZE];
+    threadgroup float3 collected_Tu[RAST_BLOCK_SIZE];
+    threadgroup float3 collected_Tv[RAST_BLOCK_SIZE];
+    threadgroup float3 collected_Tw[RAST_BLOCK_SIZE];
+    threadgroup float3 collected_rgb[RAST_BLOCK_SIZE];
+
+    // Per-pixel forward outputs needed to re-derive gradients.
+    float3 T_M1_M2     = inside ? float3(final_Ts[3*pix_id+0], final_Ts[3*pix_id+1], final_Ts[3*pix_id+2]) : float3(0);
+    const float T_final = T_M1_M2.x;
+    const float final_D = T_M1_M2.y;
+    const float final_D2 = T_M1_M2.z;
+    const float final_A = 1.0f - T_final;
+
+    int2 contribs = inside ? int2(final_index[2*pix_id+0], final_index[2*pix_id+1]) : int2(-1, -1);
+    const int last_contributor   = contribs.x;
+    const int median_contributor = contribs.y;
+
+    // Per-pixel upstream gradients.
+    float3 dL_dpixel = {0,0,0};
+    float dL_ddepth = 0.f;
+    float dL_daccum = 0.f;
+    float3 dL_dnormal2D = {0,0,0};
+    float dL_dmedian_depth = 0.f;
+    float dL_dreg = 0.f;
+    float3 bg = float3(background[0], background[1], background[2]);
+    if (inside) {
+        dL_dpixel = float3(dL_dout_img[3*pix_id+0], dL_dout_img[3*pix_id+1], dL_dout_img[3*pix_id+2]);
+        dL_ddepth = dL_dout_depth[pix_id];
+        dL_daccum = dL_dout_alpha[pix_id];
+        dL_dnormal2D = float3(dL_dout_normal[3*pix_id+0], dL_dout_normal[3*pix_id+1], dL_dout_normal[3*pix_id+2]);
+        dL_dmedian_depth = dL_dout_median_depth[pix_id];
+        dL_dreg = dL_dout_distortion[pix_id];
+    }
+
+    // Running state for the reverse traversal.
+    float T = T_final;
+    float3 accum_rec = {0,0,0};
+    float3 last_color = {0,0,0};
+    float last_alpha = 0.f;
+    float accum_depth_rec = 0.f;
+    float last_depth = 0.f;
+    float accum_alpha_rec = 0.f;
+    float3 accum_normal_rec = {0,0,0};
+    float3 last_normal = {0,0,0};
+    float last_dL_dT = 0.f;
+
+    int contributor = toDo;
+    bool done = !inside;
+
+    for (int r = 0; r < rounds; ++r, toDo -= RAST_BLOCK_SIZE) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load batch in REVERSE order — last-contributor at index 0.
+        int progress = r * RAST_BLOCK_SIZE + (int)tr;
+        if (range.x + progress < range.y) {
+            int sorted_idx = range.y - progress - 1;
+            collected_id[tr]            = gaussian_ids[sorted_idx];
+            collected_xy[tr]            = read_packed_float2(packed_xy, sorted_idx);
+            collected_normal_opac[tr]   = read_packed_float4(packed_normal_opac, sorted_idx);
+            uint t_base = (uint)sorted_idx * 9;
+            collected_Tu[tr] = float3(packed_transmat[t_base+0], packed_transmat[t_base+1], packed_transmat[t_base+2]);
+            collected_Tv[tr] = float3(packed_transmat[t_base+3], packed_transmat[t_base+4], packed_transmat[t_base+5]);
+            collected_Tw[tr] = float3(packed_transmat[t_base+6], packed_transmat[t_base+7], packed_transmat[t_base+8]);
+            collected_rgb[tr] = read_packed_float3(packed_rgb, sorted_idx);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, toDo);
+        for (int j2 = 0; j2 < batch_size; ++j2) {
+            // contributor counts down through the same surfels the forward
+            // visited, in reverse order. Surfels past last_contributor never
+            // contributed in the forward pass — skip them in backward too.
+            contributor--;
+            if (contributor >= last_contributor) continue;
+
+            // Recompute ray-plane intersection (same as forward).
+            const float3 Tu = collected_Tu[j2];
+            const float3 Tv = collected_Tv[j2];
+            const float3 Tw = collected_Tw[j2];
+            const float3 k = px * Tw - Tu;
+            const float3 l = py * Tw - Tv;
+            const float3 p = cross(k, l);
+            if (p.z == 0.0f) continue;
+            const float2 s = float2(p.x / p.z, p.y / p.z);
+            const float rho3d = s.x * s.x + s.y * s.y;
+            const float2 xy = collected_xy[j2];
+            const float2 d_screen = float2(xy.x - px, xy.y - py);
+            const float rho2d = FILTER_INV_SQ_2DGS * (d_screen.x * d_screen.x + d_screen.y * d_screen.y);
+            const float rho = min(rho3d, rho2d);
+
+            // Per-pixel depth at ray-plane intersection.
+            const float c_d = s.x * Tw.x + s.y * Tw.y + Tw.z;
+            if (c_d < NEAR_N_2DGS) continue;
+
+            const float power = -0.5f * rho;
+            if (power > 0.0f) continue;
+
+            const float4 nor_o = collected_normal_opac[j2];
+            const float3 normal = float3(nor_o.x, nor_o.y, nor_o.z);
+            const float opa = nor_o.w;
+            const float G = exp(power);
+            const float alpha = min(0.99f, opa * G);
+            if (alpha < 1.0f / 255.0f) continue;
+
+            // Recover prior T (T_before_this_surfel = T_after / (1 - alpha)).
+            T = T / (1.0f - alpha);
+            const float dchannel_dcolor = alpha * T;
+            const float w = alpha * T;
+
+            float dL_dalpha = 0.0f;
+            const int global_id = collected_id[j2];
+
+            // Propagate gradients on color.
+            for (int ch = 0; ch < 3; ch++) {
+                const float c = collected_rgb[j2][ch];
+                accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+                last_color[ch] = c;
+                const float dL_dch = dL_dpixel[ch];
+                dL_dalpha += (c - accum_rec[ch]) * dL_dch;
+                // dL_dcolors[global_id*3 + ch] += dchannel_dcolor * dL_dch
+                atomic_fetch_add_explicit(&dL_dcolors[3 * global_id + ch], dchannel_dcolor * dL_dch, memory_order_relaxed);
+            }
+
+            // Aux-output gradients: median depth, distortion, depth, alpha, normal.
+            float dL_dz = 0.0f;
+            float dL_dweight = 0.0f;
+
+            const float m_d = FAR_N_2DGS / (FAR_N_2DGS - NEAR_N_2DGS) * (1.0f - NEAR_N_2DGS / c_d);
+            const float dmd_dd = (FAR_N_2DGS * NEAR_N_2DGS) / ((FAR_N_2DGS - NEAR_N_2DGS) * c_d * c_d);
+            if (contributor == median_contributor - 1) {
+                dL_dz += dL_dmedian_depth;
+            }
+            // Distortion gradient: weight gradient + dL_dz contribution.
+            // DETACH_WEIGHT=0 path — match backward.cu line 356.
+            dL_dweight += (final_D2 + m_d * m_d * final_A - 2.0f * m_d * final_D) * dL_dreg;
+            dL_dalpha += dL_dweight - last_dL_dT;
+            last_dL_dT = dL_dweight * alpha + (1.0f - alpha) * last_dL_dT;
+            const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
+            dL_dz += dL_dmd * dmd_dd;
+
+            // Ray-splat depth → alpha-weighted depth output.
+            accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
+            last_depth = c_d;
+            dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
+
+            // Accumulated alpha output.
+            accum_alpha_rec = last_alpha * 1.0f + (1.f - last_alpha) * accum_alpha_rec;
+            dL_dalpha += (1.0f - accum_alpha_rec) * dL_daccum;
+
+            // Normal gradients.
+            for (int ch = 0; ch < 3; ch++) {
+                accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
+                last_normal[ch] = normal[ch];
+                dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
+                atomic_fetch_add_explicit(&dL_dnormal3D[3 * global_id + ch], alpha * T * dL_dnormal2D[ch], memory_order_relaxed);
+            }
+
+            dL_dalpha *= T;
+            last_alpha = alpha;
+
+            // Background contribution to alpha gradient.
+            const float bg_dot = bg.x * dL_dpixel.x + bg.y * dL_dpixel.y + bg.z * dL_dpixel.z;
+            dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot;
+
+            // Helpful temporary: gradient on G (the un-clamped Gaussian factor).
+            const float dL_dG = nor_o.w * dL_dalpha;
+            dL_dz += alpha * T * dL_ddepth;
+
+            // Branch on which rho dominated the per-pixel evaluation.
+            if (rho3d <= rho2d) {
+                // 3D path: gradient flows through ray-plane intersection (s) into transMat.
+                const float2 dL_ds = float2(
+                    dL_dG * -G * s.x + dL_dz * Tw.x,
+                    dL_dG * -G * s.y + dL_dz * Tw.y);
+                const float3 dz_dTw = float3(s.x, s.y, 1.0f);
+                const float dsx_pz = dL_ds.x / p.z;
+                const float dsy_pz = dL_ds.y / p.z;
+                const float3 dL_dp = float3(dsx_pz, dsy_pz, -(dsx_pz * s.x + dsy_pz * s.y));
+                const float3 dL_dk = cross(l, dL_dp);
+                const float3 dL_dl = cross(dL_dp, k);
+                const float3 dL_dTu = float3(-dL_dk.x, -dL_dk.y, -dL_dk.z);
+                const float3 dL_dTv = float3(-dL_dl.x, -dL_dl.y, -dL_dl.z);
+                const float3 dL_dTw = float3(
+                    px * dL_dk.x + py * dL_dl.x + dL_dz * dz_dTw.x,
+                    px * dL_dk.y + py * dL_dl.y + dL_dz * dz_dTw.y,
+                    px * dL_dk.z + py * dL_dl.z + dL_dz * dz_dTw.z);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+0], dL_dTu.x, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+1], dL_dTu.y, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+2], dL_dTu.z, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+3], dL_dTv.x, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+4], dL_dTv.y, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+5], dL_dTv.z, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+6], dL_dTw.x, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+7], dL_dTw.y, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+8], dL_dTw.z, memory_order_relaxed);
+            } else {
+                // 2D path: low-pass filter clamped — gradient flows through screen-space distance.
+                const float dG_ddelx = -G * FILTER_INV_SQ_2DGS * d_screen.x;
+                const float dG_ddely = -G * FILTER_INV_SQ_2DGS * d_screen.y;
+                atomic_fetch_add_explicit(&dL_dmean2D[2*global_id+0], dL_dG * dG_ddelx, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dmean2D[2*global_id+1], dL_dG * dG_ddely, memory_order_relaxed);
+                // Depth gradient still routed through transMat row 2 (Tw).
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+6], s.x * dL_dz, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+7], s.y * dL_dz, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+8], dL_dz, memory_order_relaxed);
+            }
+
+            // Opacity gradient.
+            atomic_fetch_add_explicit(&dL_dopacity[global_id], G * dL_dalpha, memory_order_relaxed);
+        }
+    }
+}
+
 // ===== Prefix Sum Kernel =====
 // Single-dispatch inclusive prefix sum (cumsum) for int32 arrays.
 // Uses one threadgroup: each thread serially sums its chunk, thread 0 scans

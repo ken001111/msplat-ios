@@ -132,6 +132,8 @@ struct MetalContext {
     id<MTLComputePipelineState> project_and_sh_forward_2dgs_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_2dgs_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_2dgs_kernel_cpso;
+    // 2DGS backward pipeline (M2.2 — dead code until dispatch lands in M2.5)
+    id<MTLComputePipelineState> nd_rasterize_backward_2dgs_kernel_cpso;
     // Tile-local sorting (shared with densify)
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     // Prefix sum (shared with densify)
@@ -222,6 +224,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->project_and_sh_forward_2dgs_kernel_cpso  = load(@"project_and_sh_forward_2dgs_kernel");
     ctx->nd_rasterize_forward_2dgs_kernel_cpso    = load(@"nd_rasterize_forward_2dgs_kernel");
     ctx->bitonic_sort_per_tile_2dgs_kernel_cpso   = load(@"bitonic_sort_per_tile_2dgs_kernel");
+    // 2DGS backward pipeline (M2.2 — dead code until dispatch lands in M2.5).
+    ctx->nd_rasterize_backward_2dgs_kernel_cpso   = load(@"nd_rasterize_backward_2dgs_kernel");
     // Tile-local sorting + prefix sum (shared with densify)
     ctx->scatter_to_prealloc_bins_kernel_cpso     = load(@"scatter_to_prealloc_bins_kernel");
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
@@ -332,6 +336,15 @@ struct FusedTensorCache {
     MTensor out_img, final_Ts, final_idx, out_depth, out_normal;
     MTensor out_alpha, out_median_depth, out_distortion;
 
+    // M2.2 backward gradient accumulators — atomically scattered by the
+    // backward rasterizer, then read by the backward projection (M2.3) to
+    // produce gradients w.r.t. means3D / scales / quats / opacities / SH.
+    MTensor dL_dtransMat;   // [N, 9]  per-gaussian
+    MTensor dL_dmean2D;     // [N, 2]  per-gaussian (screen-space, for densify stats)
+    MTensor dL_dnormal3D;   // [N, 3]  per-gaussian
+    MTensor dL_dopacity;    // [N, 1]  per-gaussian
+    MTensor dL_dcolors;     // [N, 3]  per-gaussian (gradient on raw SH-output color)
+
     // Tile-local sorting buffers (shared with densify)
     MTensor tile_bins;
     MTensor tile_offsets, tile_scatter_counters;
@@ -357,6 +370,12 @@ struct FusedTensorCache {
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
             transMats = mtensor_empty(dev, {np, 9}, DType::Float32);
             normal_opacity = mtensor_empty(dev, {np, 4}, DType::Float32);
+            // M2.2 backward accumulators (gradients scattered atomically per gaussian).
+            dL_dtransMat = mtensor_empty(dev, {np, 9}, DType::Float32);
+            dL_dmean2D = mtensor_empty(dev, {np, 2}, DType::Float32);
+            dL_dnormal3D = mtensor_empty(dev, {np, 3}, DType::Float32);
+            dL_dopacity = mtensor_empty(dev, {np, 1}, DType::Float32);
+            dL_dcolors = mtensor_empty(dev, {np, 3}, DType::Float32);
         }
         if (cap != capacity) {
             capacity = cap;
