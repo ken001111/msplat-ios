@@ -203,142 +203,20 @@ int main(int argc, char *argv[]) {
             return 0;
         }
 
-        std::vector<size_t> camIndices(cams.size());
-        std::iota(camIndices.begin(), camIndices.end(), 0);
-        InfiniteRandomIterator<size_t> camsIter(camIndices);
-
-        size_t step = 1;
-        if (!resume.empty()) step = model.loadPly(resume) + 1;
-
-        bool benchmarking = std::getenv("BENCHMARK") != nullptr;
-        int bench_warmup = 50;
-        std::vector<double> bench_iter_ms, bench_cpu_ms, bench_drain_ms;
-        if (benchmarking) {
-            bench_iter_ms.reserve(numIters);
-            bench_cpu_ms.reserve(numIters);
-            bench_drain_ms.reserve(numIters);
+        // Training is disabled in this build — the 3DGS train_step was retired
+        // in the Phase 2b cleanup, and the 2DGS backward port + train_step land
+        // in Milestone 2. The remaining CLI surface is render/eval against a
+        // pre-trained scene loaded via --resume, plus the inference helpers
+        // (--render-only, --dump-init-scales). Anything that hit the training
+        // loop now errors clearly.
+        if (resume.empty()) {
+            throw std::runtime_error(
+                "msplat: training is not available in this build (Phase 2b cleanup; "
+                "2DGS backward port pending in Milestone 2). Use --resume <PLY> for "
+                "evaluation against a pre-trained scene, or --render-only <PLY> for "
+                "single-camera inference.");
         }
-        auto cpu_now = []() { return std::chrono::high_resolution_clock::now(); };
-
-        auto bench_start = cpu_now();
-        for (; step <= (size_t)numIters; step++) {
-            Camera &cam = cams[camsIter.next()];
-
-            auto iter_start = cpu_now();
-            MTensor gt = cam.getGPUImage(model.getDownscaleFactor(step));
-            model.fullIteration(cam, step, gt, ssimWeight);
-            model.schedulersStep(step);
-            model.afterTrain(step);
-            msplat_commit();
-
-            if (benchmarking && step > (size_t)bench_warmup) {
-                auto pre_sync = cpu_now();
-                msplat_gpu_sync();
-                auto iter_end = cpu_now();
-                double iter_ms = std::chrono::duration_cast<std::chrono::microseconds>(iter_end - iter_start).count() / 1000.0;
-                double cpu_ms = std::chrono::duration_cast<std::chrono::microseconds>(pre_sync - iter_start).count() / 1000.0;
-                double drain_ms = std::chrono::duration_cast<std::chrono::microseconds>(iter_end - pre_sync).count() / 1000.0;
-                bench_iter_ms.push_back(iter_ms);
-                bench_cpu_ms.push_back(cpu_ms);
-                bench_drain_ms.push_back(drain_ms);
-            }
-
-            if (saveEvery > 0 && step % saveEvery == 0) {
-                fs::path p(outputScene);
-                model.save(p.replace_filename(fs::path(p.stem().string() + "_" + std::to_string(step) + p.extension().string())).string(), step);
-            }
-
-            if (!valRender.empty() && step % 10 == 0) {
-                MTensor rgb = model.render(*valCam, step);
-                msplat_gpu_sync();
-                MTensor rgb_cpu = rgb.cpu();
-                Image valImg;
-                valImg.width = (int)rgb_cpu.size(1);
-                valImg.height = (int)rgb_cpu.size(0);
-                valImg.data.resize(valImg.width * valImg.height * 3);
-                memcpy(valImg.ptr(), rgb_cpu.data_ptr(), valImg.data.size() * sizeof(float));
-                imwriteRGB((fs::path(valRender) / (std::to_string(step) + ".png")).string(), valImg);
-            }
-        }
-
-        if (benchmarking && !bench_iter_ms.empty()) {
-            auto bench_end = cpu_now();
-            double total_s = std::chrono::duration_cast<std::chrono::milliseconds>(bench_end - bench_start).count() / 1000.0;
-            size_t n = bench_iter_ms.size();
-            std::vector<double> sorted = bench_iter_ms;
-            std::sort(sorted.begin(), sorted.end());
-            double sum = std::accumulate(sorted.begin(), sorted.end(), 0.0);
-            double mean = sum / n;
-            double median = (n % 2 == 0) ? (sorted[n/2-1] + sorted[n/2]) / 2.0 : sorted[n/2];
-            double sq_sum = 0;
-            for (double v : sorted) sq_sum += (v - mean) * (v - mean);
-            double stddev = std::sqrt(sq_sum / n);
-
-            std::cout << "\n=== Benchmark (" << n << " iters, " << bench_warmup << " warmup, " << total_s << "s total) ===\n";
-            std::cout << "  mean:   " << mean   << " ms/iter\n";
-            std::cout << "  median: " << median  << " ms/iter\n";
-            std::cout << "  stddev: " << stddev  << " ms/iter\n";
-            std::cout << "  p5:     " << sorted[(size_t)(n * 0.05)] << " ms/iter\n";
-            std::cout << "  p95:    " << sorted[(size_t)(n * 0.95)] << " ms/iter\n";
-            std::cout << "  min:    " << sorted.front() << " ms/iter\n";
-            std::cout << "  max:    " << sorted.back()  << " ms/iter\n";
-            std::cout << "  wall:   " << total_s << "s for " << numIters << " iters\n";
-
-            auto stats = [](std::vector<double> &v) {
-                std::vector<double> s = v;
-                std::sort(s.begin(), s.end());
-                size_t n = s.size();
-                double sum = std::accumulate(s.begin(), s.end(), 0.0);
-                double med = (n % 2 == 0) ? (s[n/2-1] + s[n/2]) / 2.0 : s[n/2];
-                return std::make_pair(sum / n, med);
-            };
-            auto [cpu_mean, cpu_med] = stats(bench_cpu_ms);
-            auto [drain_mean, drain_med] = stats(bench_drain_ms);
-            std::cout << "\n  --- CPU dispatch vs GPU drain ---\n";
-            std::cout << "  cpu dispatch:  mean=" << cpu_mean << "  median=" << cpu_med << " ms\n";
-            std::cout << "  gpu drain:     mean=" << drain_mean << "  median=" << drain_med << " ms\n";
-            std::cout << "  gpu fraction:  " << (drain_med / median * 100) << "%\n";
-
-            // GPU timing from completion handlers (PROFILE_GPU=1)
-            std::vector<double> gpu_times;
-            msplat_drain_gpu_times(gpu_times);
-            if (!gpu_times.empty()) {
-                auto [gpu_mean, gpu_med] = stats(gpu_times);
-                std::vector<double> gs = gpu_times;
-                std::sort(gs.begin(), gs.end());
-                std::cout << "\n  --- GPU kernel time (from CB completion handlers) ---\n";
-                std::cout << "  gpu exec:   mean=" << gpu_mean << "  median=" << gpu_med << " ms\n";
-                std::cout << "  gpu p5:     " << gs[(size_t)(gs.size() * 0.05)] << " ms\n";
-                std::cout << "  gpu p95:    " << gs[(size_t)(gs.size() * 0.95)] << " ms\n";
-                std::cout << "  gpu min:    " << gs.front() << " ms\n";
-                std::cout << "  gpu max:    " << gs.back() << " ms\n";
-                std::cout << "  n_cbs:      " << gs.size() << "\n";
-            }
-
-            // Per-stage GPU timing (PROFILE_STAGES=1)
-            constexpr int MAX_STAGES = 16;
-            std::vector<double> stage_times[MAX_STAGES];
-            const char* stage_names[MAX_STAGES] = {};
-            int n_stages = 0;
-            msplat_drain_stage_times(stage_times, MAX_STAGES, n_stages, stage_names);
-            bool has_stage_data = false;
-            for (int i = 0; i < n_stages; i++) if (!stage_times[i].empty()) { has_stage_data = true; break; }
-            if (has_stage_data) {
-                std::cout << "\n  --- Per-stage GPU time (Metal timestamp counters) ---\n";
-                double total_med = 0;
-                for (int i = 0; i < n_stages; i++) {
-                    if (stage_times[i].empty()) continue;
-                    auto [s_mean, s_med] = stats(stage_times[i]);
-                    total_med += s_med;
-                    std::cout << "  " << std::left << std::setw(22) << stage_names[i]
-                              << "median=" << std::fixed << std::setprecision(3) << s_med
-                              << "ms  mean=" << s_mean << "ms  (" << stage_times[i].size() << " samples)\n";
-                }
-                std::cout << "  " << std::left << std::setw(22) << "TOTAL (sum medians)"
-                          << std::fixed << std::setprecision(3) << total_med << "ms\n";
-            }
-            std::cout << "\n";
-        }
+        model.loadPly(resume);
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene, numIters);

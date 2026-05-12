@@ -52,26 +52,8 @@ MTensor msplat_render(
     MTensor &opacities, MTensor &background
 );
 
-// Fused forward + backward + Adam + grad_stats in one encoder
-// Returns: (radii [N], loss_value float)
-std::tuple<MTensor, float> msplat_train_step(
-    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
-    MTensor &quats, MTensor &viewmat, MTensor &projmat,
-    float fx, float fy, float cx, float cy,
-    unsigned img_height, unsigned img_width,
-    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
-    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
-    MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background,
-    MTensor &gt, MTensor &window2d, float ssim_weight,
-    float loss_inv_n, int features_rest_bases,
-    int num_adam_groups,
-    MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
-    float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps,
-    MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
-);
+// msplat_train_step removed — 3DGS training path retired in Phase 2b cleanup.
+// The 2DGS backward port + corresponding train_step land in Milestone 2.
 
 int msplat_densify(
     int N, int buf_capacity,

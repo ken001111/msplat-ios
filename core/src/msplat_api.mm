@@ -104,36 +104,20 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
 Trainer::~Trainer() = default;
 
 Stats Trainer::step() {
-    impl->currentStep++;
-    size_t camIdx = impl->nextCamera();
-    Camera& cam = impl->ds->trainCams[camIdx];
-
-    int ds = impl->model->getDownscaleFactor(impl->currentStep);
-    MTensor& gt = cam.getGPUImage(ds);
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
-    impl->model->schedulersStep(impl->currentStep);
-    impl->model->afterTrain(impl->currentStep);
-    msplat_commit();
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    float ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0f;
-
-    Stats s;
-    s.iteration = impl->currentStep;
-    s.splatCount = (int)impl->model->means.size(0);
-    s.msPerStep = ms;
-    return s;
+    // 3DGS training was retired in the Phase 2b cleanup; the 2DGS backward
+    // port + train_step land in Milestone 2. Callers should branch on this
+    // until the new train_step is wired up. Render / eval / export still work.
+    throw std::runtime_error(
+        "Trainer::step: training is not available in this build "
+        "(Phase 2b cleanup; 2DGS train_step lands in Milestone 2). "
+        "Use render() / renderFromPose() / evaluate() against a loaded scene instead.");
 }
 
-void Trainer::train(int callbackEvery) {
-    while (impl->currentStep < impl->config.iterations) {
-        step();
-        // Note: callbacks handled at the Swift level via polling iteration()
-        // to keep the C++ API free of function pointer complexity
-    }
+void Trainer::train(int /*callbackEvery*/) {
+    // See Trainer::step.
+    throw std::runtime_error(
+        "Trainer::train: training is not available in this build "
+        "(Phase 2b cleanup; 2DGS train_step lands in Milestone 2).");
 }
 
 EvalMetrics Trainer::evaluate() {

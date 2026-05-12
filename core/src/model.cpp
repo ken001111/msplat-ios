@@ -543,55 +543,5 @@ MTensor Model::render(Camera& cam, int step){
         opacities, backgroundColor);
 }
 
-void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
-    auto s = prepareCam(cam, step);
-    lastHeight = s.height; lastWidth = s.width;
-    int numPoints = means.size(0);
-
-    // Initialize SSIM window (once)
-    if (!window2d.defined()) {
-        auto w = createSSIMWindow(11, 1.5f);
-        window2d = gpu_empty({11, 11}, DType::Float32);
-        memcpy(window2d.data_ptr(), w.data(), w.size() * sizeof(float));
-    }
-
-    adam_step_count++;
-    float bc1 = 1.0f - std::pow(adam_beta1, adam_step_count);
-    float bc2 = 1.0f - std::pow(adam_beta2, adam_step_count);
-    MTensor adam_p[N_ADAM_GROUPS];
-    MTensor adam_ea[N_ADAM_GROUPS], adam_eas[N_ADAM_GROUPS];
-    float adam_ss[N_ADAM_GROUPS], adam_bc2s[N_ADAM_GROUPS];
-    MTensor *params[] = {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities};
-    for (int i = 0; i < N_ADAM_GROUPS; ++i) {
-        adam_p[i] = *params[i];
-        adam_ea[i] = adam_exp_avg[i];
-        adam_eas[i] = adam_exp_avg_sq[i];
-        adam_ss[i] = adam_lr[i] / bc1;
-        adam_bc2s[i] = std::sqrt(bc2);
-    }
-
-    if (!xysGradNorm.defined()) {
-    
-        xysGradNorm = gpu_zeros({numPoints}, DType::Float32);
-        visCounts = gpu_zeros({numPoints}, DType::Float32);
-        max2DSize = gpu_zeros({numPoints}, DType::Float32);
-    }
-
-    float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
-    float lossInvN = 1.0f / (float)(s.height * s.width * 3);
-
-    auto [r, loss] = msplat_train_step(
-        numPoints, means, scales, 1.0f,
-        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
-        s.height, s.width, s.tileBounds, 0.01f,
-        s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor, gt, window2d, ssimWeight,
-        lossInvN, (int)featuresRest.size(-2),
-        N_ADAM_GROUPS,
-        adam_p, adam_ea, adam_eas,
-        adam_ss, adam_bc2s,
-        adam_beta1, adam_beta2, adam_eps,
-        visCounts, xysGradNorm, max2DSize, invMaxDim);
-
-    radii = r;
-}
+// Model::fullIteration removed — 3DGS training retired in Phase 2b cleanup.
+// 2DGS train_step lands in Milestone 2.
