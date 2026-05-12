@@ -369,6 +369,14 @@ struct FusedTensorCache {
     MTensor ssim_h_buf;
     MTensor tile_bins, loss_sum;
 
+    // 2DGS forward intermediates (Phase 2b.3.1) — sit alongside the 3DGS
+    // buffers; allocated unconditionally so either path can dispatch without
+    // a second ensure_forward pass. The 3DGS `conics`/`packed_xy_opac`/
+    // `packed_conic` buffers are simply unused when the 2DGS dispatch runs.
+    MTensor transMats, normal_opacity;                            // per-gaussian
+    MTensor packed_xy, packed_transmat, packed_normal_opac;       // per sorted-surfel
+    MTensor out_depth, out_normal;                                // per pixel
+
     // Tile-local sorting buffers
     MTensor tile_offsets, tile_scatter_counters;
     MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64 — pre-allocated per-tile bins
@@ -403,6 +411,9 @@ struct FusedTensorCache {
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
+            // 2DGS per-gaussian outputs from project_and_sh_forward_2dgs_kernel.
+            transMats = mtensor_empty(dev, {np, 9}, DType::Float32);
+            normal_opacity = mtensor_empty(dev, {np, 4}, DType::Float32);
         }
         if (cap != capacity) {
             capacity = cap;
@@ -410,6 +421,11 @@ struct FusedTensorCache {
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            // 2DGS sorted-surfel pack, written by bitonic_sort_per_tile_2dgs_kernel
+            // and consumed by nd_rasterize_forward_2dgs_kernel.
+            packed_xy = mtensor_empty(dev, {cap, 2}, DType::Float32);
+            packed_transmat = mtensor_empty(dev, {cap, 9}, DType::Float32);
+            packed_normal_opac = mtensor_empty(dev, {cap, 4}, DType::Float32);
         }
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
@@ -419,6 +435,9 @@ struct FusedTensorCache {
             loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            // 2DGS per-pixel side outputs from nd_rasterize_forward_2dgs_kernel.
+            out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            out_normal = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
