@@ -2,6 +2,8 @@ import SwiftUI
 import UIKit
 import Combine
 import QuartzCore
+import ImageIO
+import MobileCoreServices
 import Msplat
 
 // MARK: - Pixel conversion (iOS UIImage)
@@ -179,7 +181,10 @@ struct ContentView: View {
         }
 
         // Sweep the bundle for jpg/png files and route them by extension.
-        // Whatever directory layout Xcode produced, we flatten + re-layout here.
+        // JPGs are pre-resized to <=512px max dimension via ImageIO's thumbnail
+        // API (decodes directly at target size, avoiding a full-res spike that
+        // would jetsam iOS at 148 × 1280x720 ≈ 1.6 GB). PNG masks are usually
+        // tiny so copy as-is.
         var jpgCount = 0, pngCount = 0
         if let walker = fm.enumerator(at: Bundle.main.bundleURL,
                                       includingPropertiesForKeys: nil,
@@ -190,7 +195,7 @@ struct ContentView: View {
                 if ext == "jpg" || ext == "jpeg" {
                     let dest = imagesDir.appendingPathComponent(name)
                     if !fm.fileExists(atPath: dest.path) {
-                        try? fm.copyItem(at: url, to: dest)
+                        resizeJPG(from: url, to: dest, maxPixelSize: 512)
                     }
                     jpgCount += 1
                 } else if ext == "png" {
@@ -202,7 +207,7 @@ struct ContentView: View {
                 }
             }
         }
-        print("Plan B: copied \(jpgCount) jpg + \(pngCount) png → \(target.path)")
+        print("Plan B: prepared \(jpgCount) jpg (≤512px) + \(pngCount) png → \(target.path)")
 
         guard jpgCount > 0 else {
             print("Plan B: no jpg files found in app bundle — dataset images weren't bundled.")
@@ -211,6 +216,34 @@ struct ContentView: View {
 
         preparedDatasetPath = target.path
         return target.path
+    }
+
+    /// Decode a JPG at <=maxPixelSize via ImageIO's thumbnail API (decodes
+    /// directly at the target size, no full-res intermediate buffer), then
+    /// re-encode as JPG at the destination. Key to staying under iOS's
+    /// memory cap when prepping a 148-frame dataset — full-res decode of
+    /// 148 × 1280x720 ≈ 1.6 GB would jetsam the app before training even
+    /// starts.
+    private static func resizeJPG(from src: URL, to dest: URL, maxPixelSize: Int) {
+        guard let source = CGImageSourceCreateWithURL(src as CFURL, nil) else {
+            try? FileManager.default.copyItem(at: src, to: dest)
+            return
+        }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, opts as CFDictionary) else {
+            try? FileManager.default.copyItem(at: src, to: dest)
+            return
+        }
+        let destType = "public.jpeg" as CFString
+        guard let writer = CGImageDestinationCreateWithURL(dest as CFURL, destType, 1, nil) else { return }
+        let encOpts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.9]
+        CGImageDestinationAddImage(writer, cg, encOpts as CFDictionary)
+        CGImageDestinationFinalize(writer)
     }
 
     var body: some View {
