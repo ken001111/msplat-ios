@@ -11,6 +11,12 @@ using namespace metal;
 #define CHANNELS 3
 #define MAX_REGISTER_CHANNELS 3
 
+// Scale-vector dim. 3 for 3DGS (axis-aligned ellipsoid), 2 for 2DGS (in-plane
+// disc). Kept in lockstep with core/include/model.hpp's constexpr int kScaleDim.
+// Phase 2b.3.2 (4/N) drops hardcoded `*3` indexing in the densify kernels so
+// step (5) can flip both sides to 2.
+constant int kScaleDim = 3;
+
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
 constant float SH_C2[] = {
@@ -3987,7 +3993,7 @@ kernel void densify_classify_kernel(
     constant int& N,
     constant float* xys_grad_norm    [[buffer(1)]],
     constant float* vis_counts       [[buffer(2)]],
-    constant float* scales           [[buffer(3)]],  // [N,3] log-space
+    constant float* scales           [[buffer(3)]],  // [N, kScaleDim] log-space
     constant float* max_2d_size      [[buffer(4)]],
     constant float& half_max_dim     [[buffer(5)]],  // 0.5 * max(W,H)
     constant float& grad_thresh      [[buffer(6)]],
@@ -4005,8 +4011,9 @@ kernel void densify_classify_kernel(
     float avg_grad = (xys_grad_norm[idx] / vc) * half_max_dim;
     bool high_grad = avg_grad > grad_thresh;
 
-    float s0 = scales[idx*3], s1 = scales[idx*3+1], s2 = scales[idx*3+2];
-    float max_scale = max(max(exp(s0), exp(s1)), exp(s2));
+    float max_scale = exp(scales[idx*kScaleDim]);
+    for (int k = 1; k < kScaleDim; k++)
+        max_scale = max(max_scale, exp(scales[idx*kScaleDim + k]));
     bool is_large = max_scale > size_thresh;
 
     bool do_split = is_large;
@@ -4061,8 +4068,14 @@ kernel void densify_append_split_kernel(
     float qlen = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
     qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
 
-    // Parent scale (exp)
-    float sx = exp(scales_buf[idx*3]), sy = exp(scales_buf[idx*3+1]), sz = exp(scales_buf[idx*3+2]);
+    // Parent scale (exp). For 2DGS the third axis doesn't exist — zero it so
+    // the random-sample offset has no out-of-plane component. Not a principled
+    // 2DGS split (that would rotate the in-plane offset by the tangent frame
+    // via the quat), but densify isn't dispatched in Milestone 1's render path;
+    // the principled 2DGS split lands in Milestone 2.
+    float sx = exp(scales_buf[idx*kScaleDim]);
+    float sy = (kScaleDim > 1) ? exp(scales_buf[idx*kScaleDim+1]) : 0.0f;
+    float sz = (kScaleDim > 2) ? exp(scales_buf[idx*kScaleDim+2]) : 0.0f;
 
     // For each of 2 children
     for (int k = 0; k < 2; k++) {
@@ -4084,10 +4097,9 @@ kernel void densify_append_split_kernel(
         means_buf[child*3+1] = means_buf[idx*3+1] + v1;
         means_buf[child*3+2] = means_buf[idx*3+2] + v2;
 
-        // Child scale = shrunk parent scale
-        scales_buf[child*3]   = scales_buf[idx*3]   - log_size_fac;
-        scales_buf[child*3+1] = scales_buf[idx*3+1] - log_size_fac;
-        scales_buf[child*3+2] = scales_buf[idx*3+2] - log_size_fac;
+        // Child scale = shrunk parent scale (kScaleDim entries — 3 for 3DGS, 2 for 2DGS)
+        for (int j = 0; j < kScaleDim; j++)
+            scales_buf[child*kScaleDim + j] = scales_buf[idx*kScaleDim + j] - log_size_fac;
 
         // Copy parent quaternion, featuresDc, opacities
         for (int j = 0; j < 4; j++) quats_buf[child*4+j] = quats_buf[idx*4+j];
@@ -4095,19 +4107,18 @@ kernel void densify_append_split_kernel(
         for (int j = 0; j < fr_stride; j++) featuresRest_buf[child*fr_stride+j] = featuresRest_buf[idx*fr_stride+j];
         opacities_buf[child] = opacities_buf[idx];
 
-        // Zero optimizer state for children (strides: 3,3,4,3,fr_stride,1)
-        for (int j = 0; j < 3; j++) { adam_ea0[child*3+j] = 0; adam_es0[child*3+j] = 0; }
-        for (int j = 0; j < 3; j++) { adam_ea1[child*3+j] = 0; adam_es1[child*3+j] = 0; }
-        for (int j = 0; j < 4; j++) { adam_ea2[child*4+j] = 0; adam_es2[child*4+j] = 0; }
-        for (int j = 0; j < 3; j++) { adam_ea3[child*3+j] = 0; adam_es3[child*3+j] = 0; }
-        for (int j = 0; j < fr_stride; j++) { adam_ea4[child*fr_stride+j] = 0; adam_es4[child*fr_stride+j] = 0; }
+        // Zero optimizer state for children (strides: 3, kScaleDim, 4, 3, fr_stride, 1)
+        for (int j = 0; j < 3; j++)          { adam_ea0[child*3+j] = 0;          adam_es0[child*3+j] = 0; }
+        for (int j = 0; j < kScaleDim; j++)  { adam_ea1[child*kScaleDim+j] = 0;  adam_es1[child*kScaleDim+j] = 0; }
+        for (int j = 0; j < 4; j++)          { adam_ea2[child*4+j] = 0;          adam_es2[child*4+j] = 0; }
+        for (int j = 0; j < 3; j++)          { adam_ea3[child*3+j] = 0;          adam_es3[child*3+j] = 0; }
+        for (int j = 0; j < fr_stride; j++)  { adam_ea4[child*fr_stride+j] = 0;  adam_es4[child*fr_stride+j] = 0; }
         adam_ea5[child] = 0; adam_es5[child] = 0;
     }
 
     // Shrink parent scale in-place
-    scales_buf[idx*3]   -= log_size_fac;
-    scales_buf[idx*3+1] -= log_size_fac;
-    scales_buf[idx*3+2] -= log_size_fac;
+    for (int j = 0; j < kScaleDim; j++)
+        scales_buf[idx*kScaleDim + j] -= log_size_fac;
 }
 
 // Append duplicate copies into backing buffers. One thread per original gaussian.
@@ -4145,18 +4156,18 @@ kernel void densify_append_dup_kernel(
     int dst = N + 2 * nSplits + ord;
 
     // Copy all parent data
-    for (int j = 0; j < 3; j++) means_buf[dst*3+j] = means_buf[idx*3+j];
-    for (int j = 0; j < 3; j++) scales_buf[dst*3+j] = scales_buf[idx*3+j];
-    for (int j = 0; j < 4; j++) quats_buf[dst*4+j] = quats_buf[idx*4+j];
-    for (int j = 0; j < 3; j++) featuresDc_buf[dst*3+j] = featuresDc_buf[idx*3+j];
-    for (int j = 0; j < fr_stride; j++) featuresRest_buf[dst*fr_stride+j] = featuresRest_buf[idx*fr_stride+j];
+    for (int j = 0; j < 3; j++)         means_buf[dst*3+j]                 = means_buf[idx*3+j];
+    for (int j = 0; j < kScaleDim; j++) scales_buf[dst*kScaleDim+j]        = scales_buf[idx*kScaleDim+j];
+    for (int j = 0; j < 4; j++)         quats_buf[dst*4+j]                 = quats_buf[idx*4+j];
+    for (int j = 0; j < 3; j++)         featuresDc_buf[dst*3+j]            = featuresDc_buf[idx*3+j];
+    for (int j = 0; j < fr_stride; j++) featuresRest_buf[dst*fr_stride+j]  = featuresRest_buf[idx*fr_stride+j];
     opacities_buf[dst] = opacities_buf[idx];
 
-    // Zero optimizer state
-    for (int j = 0; j < 3; j++) { adam_ea0[dst*3+j] = 0; adam_es0[dst*3+j] = 0; }
-    for (int j = 0; j < 3; j++) { adam_ea1[dst*3+j] = 0; adam_es1[dst*3+j] = 0; }
-    for (int j = 0; j < 4; j++) { adam_ea2[dst*4+j] = 0; adam_es2[dst*4+j] = 0; }
-    for (int j = 0; j < 3; j++) { adam_ea3[dst*3+j] = 0; adam_es3[dst*3+j] = 0; }
+    // Zero optimizer state (strides: 3, kScaleDim, 4, 3, fr_stride, 1)
+    for (int j = 0; j < 3; j++)         { adam_ea0[dst*3+j] = 0;         adam_es0[dst*3+j] = 0; }
+    for (int j = 0; j < kScaleDim; j++) { adam_ea1[dst*kScaleDim+j] = 0; adam_es1[dst*kScaleDim+j] = 0; }
+    for (int j = 0; j < 4; j++)         { adam_ea2[dst*4+j] = 0;         adam_es2[dst*4+j] = 0; }
+    for (int j = 0; j < 3; j++)         { adam_ea3[dst*3+j] = 0;         adam_es3[dst*3+j] = 0; }
     for (int j = 0; j < fr_stride; j++) { adam_ea4[dst*fr_stride+j] = 0; adam_es4[dst*fr_stride+j] = 0; }
     adam_ea5[dst] = 0; adam_es5[dst] = 0;
 }
@@ -4195,8 +4206,9 @@ kernel void densify_cull_classify_kernel(
 
     // Huge gaussians
     if (check_huge) {
-        float s0 = scales_buf[idx*3], s1 = scales_buf[idx*3+1], s2 = scales_buf[idx*3+2];
-        float max_s = max(max(exp(s0), exp(s1)), exp(s2));
+        float max_s = exp(scales_buf[idx*kScaleDim]);
+        for (int k = 1; k < kScaleDim; k++)
+            max_s = max(max_s, exp(scales_buf[idx*kScaleDim + k]));
         if (max_s > cull_scale_thresh) cull = true;
         if (check_screen && idx < (uint)N_old && max_2d_size[idx] > cull_screen_size) cull = true;
     }
