@@ -9,6 +9,11 @@ int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
 float l1_loss(const MTensor& rendered, const MTensor& gt);
 
+// Per-gaussian scale-vector dimensionality. 3 for 3DGS (full ellipsoid),
+// 2 for 2DGS surfels (tangent-plane disc). Phase 2b.2a holds this at 3 so
+// the refactor is byte-identical; 2b.2b flips it to 2.
+constexpr int kScaleDim = 3;
+
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,

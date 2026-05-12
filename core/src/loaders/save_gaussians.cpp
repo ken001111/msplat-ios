@@ -1,4 +1,5 @@
 #include "loaders.hpp"
+#include "model.hpp"
 #include "msplat.hpp"
 #include <fstream>
 #include <algorithm>

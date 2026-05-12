@@ -60,15 +60,15 @@ Model::Model(const InputData &inputData, int numCameras,
     means = gpu_empty({numPoints, 3}, DType::Float32);
     memcpy(means.data_ptr(), inputData.points.xyz.data(), numPoints * 3 * sizeof(float));
 
-    // Scales: KD-tree nearest neighbor distances, log'd, repeated 3x
+    // Scales: KD-tree nearest neighbor distances, log'd, repeated kScaleDim times
     {
         PointsTensor pt(inputData.points.xyz.data(), numPoints);
         auto sc = pt.scales();  // vector<float> of length numPoints
-        scales = gpu_empty({numPoints, 3}, DType::Float32);
+        scales = gpu_empty({numPoints, kScaleDim}, DType::Float32);
         float *sp = scales.data<float>();
         for (int64_t i = 0; i < numPoints; i++) {
             float v = std::log(sc[i]);
-            sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
+            for (int d = 0; d < kScaleDim; d++) sp[i*kScaleDim + d] = v;
         }
     }
 
