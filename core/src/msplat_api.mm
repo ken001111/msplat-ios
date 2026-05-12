@@ -239,6 +239,16 @@ void Trainer::exportPly(const std::string& path) {
     impl->model->savePly(path, impl->currentStep);
 }
 
+int64_t Trainer::extractMesh(const std::string& path,
+                              float voxelSize, float boundRadius,
+                              float alphaThresh, float truncMultiplier) {
+    auto grid = impl->model->makeVoxelGrid(impl->ds->trainCams, voxelSize, boundRadius);
+    float truncDist = truncMultiplier * voxelSize;
+    impl->model->integrateTSDF(grid, impl->ds->trainCams, impl->currentStep,
+                                truncDist, alphaThresh);
+    return impl->model->extractMesh(grid, path);
+}
+
 void Trainer::exportSplat(const std::string& path) {
     impl->model->saveSplat(path);
 }
@@ -364,6 +374,13 @@ void msplat_trainer_render_pose_to_buffer(MsplatTrainer t, const float camToWorl
 
 void msplat_trainer_export_ply(MsplatTrainer t, const char* path) {
     static_cast<msplat::Trainer*>(t)->exportPly(std::string(path));
+}
+
+int64_t msplat_trainer_extract_mesh(MsplatTrainer t, const char* path,
+                                     float voxelSize, float boundRadius,
+                                     float alphaThresh, float truncMultiplier) {
+    return static_cast<msplat::Trainer*>(t)->extractMesh(
+        std::string(path), voxelSize, boundRadius, alphaThresh, truncMultiplier);
 }
 
 void msplat_trainer_export_splat(MsplatTrainer t, const char* path) {

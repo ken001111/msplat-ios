@@ -137,6 +137,16 @@ public:
     /// Export scene to PLY format.
     void exportPly(const std::string& path);
 
+    /// Phase 2c: extract a triangle mesh via TSDF fusion + Marching Cubes,
+    /// save as PLY. voxelSize / boundRadius / alphaThresh / truncMultiplier
+    /// control the grid resolution, extent, per-pixel alpha cutoff, and
+    /// SDF truncation in voxel widths. Returns triangle count.
+    int64_t extractMesh(const std::string& path,
+                         float voxelSize = 0.004f,
+                         float boundRadius = 0.3f,
+                         float alphaThresh = 0.5f,
+                         float truncMultiplier = 4.0f);
+
     /// Export scene to .splat format.
     void exportSplat(const std::string& path);
 

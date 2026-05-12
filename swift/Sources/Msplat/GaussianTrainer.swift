@@ -77,6 +77,18 @@ public class GaussianTrainer {
         msplat_trainer_export_ply(handle, path)
     }
 
+    /// Phase 2c: extract a triangle mesh via TSDF fusion + Marching Cubes.
+    /// Returns the number of triangles written to the PLY at `path`.
+    @discardableResult
+    public func extractMesh(to path: String,
+                             voxelSize: Float = 0.004,
+                             boundRadius: Float = 0.3,
+                             alphaThresh: Float = 0.5,
+                             truncMultiplier: Float = 4.0) -> Int64 {
+        msplat_trainer_extract_mesh(handle, path, voxelSize, boundRadius,
+                                     alphaThresh, truncMultiplier)
+    }
+
     /// Export scene as .splat.
     public func exportSplat(to path: String) {
         msplat_trainer_export_splat(handle, path)

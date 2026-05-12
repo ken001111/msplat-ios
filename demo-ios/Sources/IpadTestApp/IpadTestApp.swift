@@ -63,6 +63,13 @@ final class Engine: ObservableObject {
     @Published var lastLoss: Float = 0
     @Published var residentMB: UInt64 = 0
     @Published var running: Bool = false
+    @Published var trainedAtLeastOnce: Bool = false
+    @Published var meshExtracting: Bool = false
+    @Published var meshTriangles: Int64 = 0
+    @Published var meshPath: String? = nil
+
+    // Held after training so the "Extract Mesh" button can call into it.
+    private var trainer: GaussianTrainer? = nil
 
     func start(datasetPath: String, iterations: Int) {
         running = true
@@ -85,7 +92,10 @@ final class Engine: ObservableObject {
                 config.bgColor = (0, 0, 0)
                 let trainer = GaussianTrainer(dataset: dataset, config: config)
 
-                DispatchQueue.main.async { self.status = "training" }
+                DispatchQueue.main.async {
+                    self.status = "training"
+                    self.trainer = trainer  // retain for the "Extract Mesh" button
+                }
 
                 var batchStart = CACurrentMediaTime()
                 var batchSteps = 0
@@ -121,7 +131,39 @@ final class Engine: ObservableObject {
                 DispatchQueue.main.async {
                     self.status = "done"
                     self.running = false
+                    self.trainedAtLeastOnce = true
                 }
+            }
+        }
+    }
+
+    func extractMesh() {
+        guard let trainer = trainer, !meshExtracting else { return }
+        meshExtracting = true
+        status = "extracting mesh…"
+
+        // Write into Documents so the user can grab the .ply via Files app or
+        // Xcode's Devices window.
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let outURL = docs.appendingPathComponent("mesh_\(stamp).ply")
+
+        Thread.detachNewThread { [weak self] in
+            guard let self else { return }
+            let t0 = CACurrentMediaTime()
+            // iPad-friendly defaults: 4 mm voxels at 30 cm half-extent → 25 MB grid.
+            let nTri = trainer.extractMesh(to: outURL.path,
+                                            voxelSize: 0.004,
+                                            boundRadius: 0.3,
+                                            alphaThresh: 0.5,
+                                            truncMultiplier: 4.0)
+            let elapsed = CACurrentMediaTime() - t0
+
+            DispatchQueue.main.async {
+                self.meshTriangles = nTri
+                self.meshPath = outURL.path
+                self.meshExtracting = false
+                self.status = String(format: "mesh done (%lld tris, %.1fs)", nTri, elapsed)
             }
         }
     }
@@ -297,6 +339,19 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(engine.running || datasetPath == nil)
+
+                Button(engine.meshExtracting ? "Extracting…" : "Extract Mesh") {
+                    engine.extractMesh()
+                }
+                .buttonStyle(.bordered)
+                .disabled(engine.running || engine.meshExtracting || !engine.trainedAtLeastOnce)
+            }
+
+            // Mesh result (after extraction)
+            if let path = engine.meshPath, !engine.meshExtracting {
+                Text("Mesh: \(engine.meshTriangles) tris → \((path as NSString).lastPathComponent)")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.green)
             }
 
             if datasetPath == nil {
