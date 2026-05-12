@@ -44,6 +44,23 @@ struct Model{
   // becomes one (x, y, z, r, g, b) tuple. Returns number of points written.
   int64_t exportPointCloud(std::vector<Camera> &cameras, int step,
                             float alphaThresh, const std::string &outPath);
+
+  // Phase 2c.1: voxel grid container for on-device TSDF fusion. Stored
+  // as [Dz, Dy, Dx, 2] Float32 — last dim is (sdf, weight). Allocated and
+  // zero-init'd by makeVoxelGrid.
+  struct VoxelGrid {
+    float origin[3];      // world position of voxel (0, 0, 0)
+    int dims[3];          // (Dx, Dy, Dz) voxels per axis
+    float voxelSize;      // edge length of one voxel, meters
+    MTensor data;         // (Dz, Dy, Dx, 2) — (sdf, weight) per voxel
+  };
+
+  // Compute grid extents from the camera centroid + radius (orbit captures
+  // naturally place the subject near the camera centroid), allocate a
+  // zero-init Metal buffer. Throws if the grid would exceed memoryCapMB.
+  VoxelGrid makeVoxelGrid(const std::vector<Camera> &cameras,
+                          float voxelSize, float boundRadius,
+                          int memoryCapMB = 512) const;
   int loadCheckpoint(const std::string &filename);
   struct CamSetup {
     float fx, fy, cx, cy;

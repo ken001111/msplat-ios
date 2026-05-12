@@ -117,6 +117,20 @@ int main(int argc, char *argv[]) {
     app.add_option("--point-cloud-alpha-thresh", pointCloudAlphaThresh,
         "Min accumulated alpha for a pixel to contribute a point (default 0.5)");
 
+    // Phase 2c.1: voxel grid sizing for TSDF fusion. --mesh-info just dumps the
+    // computed grid params (origin, dims, memory footprint) without doing
+    // fusion yet — useful for verifying the sizing is reasonable before 2c.2
+    // wires the integration kernel.
+    bool meshInfo = false;
+    app.add_flag("--mesh-info", meshInfo,
+        "Compute + print voxel-grid sizing from camera extents (Phase 2c.1)");
+    float meshVoxelSize = 0.004f;   // 4 mm — iPad-friendly default
+    app.add_option("--mesh-voxel-size", meshVoxelSize,
+        "Voxel size in meters (default 0.004 = 4 mm)");
+    float meshBound = 0.3f;          // 30 cm radius — face / small object scale
+    app.add_option("--mesh-bound", meshBound,
+        "Half-extent of the voxel grid around the camera centroid, meters (default 0.3)");
+
     // Phase 2b.3.2 (6/N) smoke hook: load a PLY (3DGS or 2DGS) and render the
     // first training camera with msplat_render, then exit. Reports min/max/mean
     // and nonzero counts on out_img + the 2DGS side outputs (out_depth /
@@ -257,6 +271,24 @@ int main(int argc, char *argv[]) {
             double pc_s = std::chrono::duration_cast<std::chrono::milliseconds>(pc_t1 - pc_t0).count() / 1000.0;
             std::cout << "Exported " << n << " points to " << exportPointCloud
                       << " in " << pc_s << "s" << std::endl;
+        }
+
+        // Phase 2c.1: voxel grid sizing (no fusion yet — that's 2c.2).
+        if (meshInfo) {
+            auto grid = model.makeVoxelGrid(cams, meshVoxelSize, meshBound);
+            int64_t numVoxels = (int64_t)grid.dims[0] * grid.dims[1] * grid.dims[2];
+            std::cout << "\n=== Voxel grid (Phase 2c.1) ===" << std::endl;
+            std::cout << "  origin:      ("
+                      << grid.origin[0] << ", " << grid.origin[1] << ", " << grid.origin[2] << ")" << std::endl;
+            std::cout << "  dims:        " << grid.dims[0] << " x " << grid.dims[1] << " x " << grid.dims[2]
+                      << " = " << numVoxels << " voxels" << std::endl;
+            std::cout << "  voxel size:  " << grid.voxelSize << " m" << std::endl;
+            std::cout << "  extent:      "
+                      << (grid.dims[0] * grid.voxelSize) << " x "
+                      << (grid.dims[1] * grid.voxelSize) << " x "
+                      << (grid.dims[2] * grid.voxelSize) << " m" << std::endl;
+            std::cout << "  buffer:      " << (numVoxels * 2 * 4) / (1024 * 1024)
+                      << " MB (Float32 sdf + weight)" << std::endl;
         }
 
         // Evaluation

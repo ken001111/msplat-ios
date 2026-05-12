@@ -628,6 +628,54 @@ int64_t Model::exportPointCloud(std::vector<Camera> &cameras, int step,
     return N;
 }
 
+// Phase 2c.1: voxel grid auto-sizing for TSDF fusion.
+//
+// Orbit captures naturally place the subject near the camera centroid — the
+// cameras circle around it looking inward — so we anchor the grid origin at
+// (camera centroid - boundRadius) and extend (2 * boundRadius) per axis.
+// Voxel count per axis = ceil(2 * boundRadius / voxelSize).
+//
+// Throws if the resulting grid would exceed memoryCapMB (we'd OOM the iPad).
+// At 2 mm voxels and 30 cm radius: 300^3 = 27M voxels × 2 floats × 4 bytes
+// = 216 MB. iPad-friendly default: 4 mm voxels, 30 cm radius → 150^3 = 27 MB.
+Model::VoxelGrid Model::makeVoxelGrid(const std::vector<Camera> &cameras,
+                                       float voxelSize, float boundRadius,
+                                       int memoryCapMB) const {
+    if (cameras.empty()) throw std::runtime_error("makeVoxelGrid: no cameras");
+
+    // Camera centroid (translation component of camToWorld, row-major).
+    float center[3] = {0, 0, 0};
+    for (const auto &cam : cameras) {
+        center[0] += cam.camToWorld[3];
+        center[1] += cam.camToWorld[7];
+        center[2] += cam.camToWorld[11];
+    }
+    center[0] /= cameras.size();
+    center[1] /= cameras.size();
+    center[2] /= cameras.size();
+
+    VoxelGrid g;
+    g.origin[0] = center[0] - boundRadius;
+    g.origin[1] = center[1] - boundRadius;
+    g.origin[2] = center[2] - boundRadius;
+    int dim = static_cast<int>(std::ceil(2.0f * boundRadius / voxelSize));
+    g.dims[0] = g.dims[1] = g.dims[2] = dim;
+    g.voxelSize = voxelSize;
+
+    int64_t numVoxels = static_cast<int64_t>(dim) * dim * dim;
+    int64_t bytes = numVoxels * 2 * 4;  // (sdf, weight) float32 per voxel
+    if (bytes > static_cast<int64_t>(memoryCapMB) * 1024 * 1024) {
+        throw std::runtime_error("makeVoxelGrid: " + std::to_string(bytes / (1024 * 1024)) +
+                                  " MB exceeds " + std::to_string(memoryCapMB) +
+                                  " MB cap (dim=" + std::to_string(dim) +
+                                  ", voxelSize=" + std::to_string(voxelSize) + "m). " +
+                                  "Increase voxelSize or decrease boundRadius.");
+    }
+    g.data = gpu_zeros({static_cast<int64_t>(dim), static_cast<int64_t>(dim),
+                         static_cast<int64_t>(dim), 2}, DType::Float32);
+    return g;
+}
+
 // M2.6: 2DGS training step. Calls msplat_train_step_2dgs to compute the
 // forward + loss + per-gaussian gradients, then runs fused_adam on each
 // of the 6 parameter groups. Returns the scalar loss for caller reporting.
