@@ -197,9 +197,12 @@ int main(int argc, char *argv[]) {
                           << "  nonzero=" << nz << "/" << n << std::endl;
             };
             std::cout << "Render done. Buffer stats:" << std::endl;
-            report("out_img",    out_img);
-            report("out_depth",  msplat_last_out_depth());
-            report("out_normal", msplat_last_out_normal());
+            report("out_img",          out_img);
+            report("out_depth",        msplat_last_out_depth());
+            report("out_normal",       msplat_last_out_normal());
+            report("out_alpha",        msplat_last_out_alpha());
+            report("out_median_depth", msplat_last_out_median_depth());
+            report("out_distortion",   msplat_last_out_distortion());
             return 0;
         }
 

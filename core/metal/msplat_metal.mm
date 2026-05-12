@@ -326,7 +326,11 @@ struct FusedTensorCache {
     MTensor transMats, normal_opacity;                            // per-gaussian
     MTensor gaussian_ids;
     MTensor packed_xy, packed_transmat, packed_normal_opac, packed_rgb;  // per sorted-surfel
-    MTensor out_img, final_Ts, final_idx, out_depth, out_normal;  // per pixel
+    // Per-pixel: out_img + DEPTH/NORMAL_OFFSET. M2.1 adds the backward-replay
+    // state (final_Ts = (T_final, M1, M2), final_idx = (last, median)) plus
+    // ALPHA / MIDDEPTH / DISTORTION offsets needed by the regularizer losses.
+    MTensor out_img, final_Ts, final_idx, out_depth, out_normal;
+    MTensor out_alpha, out_median_depth, out_distortion;
 
     // Tile-local sorting buffers (shared with densify)
     MTensor tile_bins;
@@ -365,10 +369,14 @@ struct FusedTensorCache {
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
-            final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
-            final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
+            // M2.1: final_Ts widens to (T_final, M1, M2); final_idx widens to (last, median).
+            final_Ts = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            final_idx = mtensor_empty(dev, {ih, iw, 2}, DType::Int32);
             out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
             out_normal = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            out_alpha = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            out_median_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            out_distortion = mtensor_empty(dev, {ih, iw}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
@@ -544,7 +552,9 @@ static void forward_pipeline(
     };
 
     auto encode_rast_fwd_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
-        // Monolithic only — no chunked variant in 2DGS yet (Milestone 1 scope).
+        // Monolithic only. Slots 0–12 are the M1 forward args; slots 13–15 are
+        // the M2.1 aux outputs (alpha, median_depth, distortion) needed by the
+        // backward replay + regularizer losses. background → 16, blockDim → 17.
         MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
         MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
         [enc setComputePipelineState:ctx->nd_rasterize_forward_2dgs_kernel_cpso];
@@ -558,8 +568,11 @@ static void forward_pipeline(
         ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, out_img, 10);
         ENC_BUF(enc, g_tcache.out_depth, 11);
         ENC_BUF(enc, g_tcache.out_normal, 12);
-        ENC_BUF(enc, background, 13);
-        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:14];
+        ENC_BUF(enc, g_tcache.out_alpha, 13);
+        ENC_BUF(enc, g_tcache.out_median_depth, 14);
+        ENC_BUF(enc, g_tcache.out_distortion, 15);
+        ENC_BUF(enc, background, 16);
+        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:17];
         [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
     };
 
@@ -609,10 +622,13 @@ MTensor msplat_render(
     return g_tcache.out_img;
 }
 
-// 2DGS side outputs from the most recent msplat_render. Both buffers live in
-// g_tcache and are written by nd_rasterize_forward_2dgs_kernel.
-MTensor msplat_last_out_depth()  { return g_tcache.out_depth; }
-MTensor msplat_last_out_normal() { return g_tcache.out_normal; }
+// 2DGS side outputs from the most recent msplat_render. All written by
+// nd_rasterize_forward_2dgs_kernel into g_tcache.
+MTensor msplat_last_out_depth()        { return g_tcache.out_depth; }
+MTensor msplat_last_out_normal()       { return g_tcache.out_normal; }
+MTensor msplat_last_out_alpha()        { return g_tcache.out_alpha; }
+MTensor msplat_last_out_median_depth() { return g_tcache.out_median_depth; }
+MTensor msplat_last_out_distortion()   { return g_tcache.out_distortion; }
 
 
 // ============================================================================

@@ -206,6 +206,11 @@ constant float FILTER_SIZE_2DGS = 0.707106f;
 // 1 / FilterSize^2 — pre-inverted (matches forward.cu FilterInvSquare = 2.0).
 constant float FILTER_INV_SQ_2DGS = 2.0f;
 
+// Near/far clip for the distortion regularizer's normalized depth mapping
+// m = far / (far - near) * (1 - near / depth). Matches auxiliary.h:near_n/far_n.
+constant float NEAR_N_2DGS = 0.2f;
+constant float FAR_N_2DGS = 100.0f;
+
 // Compute the 3x3 homography T that maps (u, v, 1) in the surfel tangent
 // frame → (px*w, py*w, w) in homogeneous pixel coords. Also returns the
 // surfel normal in world space.
@@ -538,12 +543,13 @@ inline void write_packed_float4(device float* arr, int idx, float4 val) {
 // Compositing logic (1/255 alpha cutoff, T < 1e-4 early exit) is identical to
 // the 3DGS path — only the per-gaussian (u, v, depth) recovery differs.
 //
-// Inference-scope: this kernel does NOT yet accumulate the distortion / median-
-// depth side outputs needed by the 2DGS regularizers (Phase 2b.4). Adding them
-// is mechanical once training works.
-//
-// Like project_and_sh_forward_2dgs_kernel, this is dead code until the host
-// dispatcher and the bitonic-sort packer learn about transMat / normal_opacity.
+// In addition to the inference outputs (out_img, out_depth, out_normal) the
+// kernel accumulates the backward-replay state that rasterize_backward_2dgs
+// needs: M1 / M2 (running depth moments in normalized depth space), the
+// per-pixel accumulated alpha, the median-depth contributor, and the depth-
+// distortion regularizer. All eight outputs are stored as separate Float32
+// tensors rather than the reference's packed [H, W, 7] aux buffer — clearer
+// to reason about on the host side.
 kernel void nd_rasterize_forward_2dgs_kernel(
     constant uint3& tile_bounds,
     constant uint3& img_size,
@@ -553,11 +559,14 @@ kernel void nd_rasterize_forward_2dgs_kernel(
     constant float* packed_normal_opac,     // float4 per sorted-gaussian — (n.x, n.y, n.z, sigmoid(opac))
     constant float* packed_transmat,        // 9 floats per sorted-gaussian — 3 rows of T
     constant float* packed_rgb,             // float3 per sorted-gaussian — raw SH output (NOT clamped)
-    device float* final_Ts,
-    device int* final_index,
+    device float* final_Ts,                 // float3 per pixel — (T_final, M1, M2) (M2.1)
+    device int* final_index,                // int2 per pixel — (last_contributor, median_contributor) (M2.1)
     device float* out_img,                  // float3 per pixel (RGB)
-    device float* out_depth,                // float per pixel — alpha-weighted depth
-    device float* out_normal,               // float3 per pixel — alpha-weighted world-space normal
+    device float* out_depth,                // float per pixel — alpha-weighted depth (DEPTH_OFFSET)
+    device float* out_normal,               // float3 per pixel — alpha-weighted normal (NORMAL_OFFSET)
+    device float* out_alpha,                // float per pixel — 1 - T_final (ALPHA_OFFSET) (M2.1)
+    device float* out_median_depth,         // float per pixel — depth where T crosses 0.5 (MIDDEPTH_OFFSET) (M2.1)
+    device float* out_distortion,           // float per pixel — depth-distortion regularizer (DISTORTION_OFFSET) (M2.1)
     constant float* background,
     constant uint2& blockDim,
     uint2 blockIdx [[threadgroup_position_in_grid]],
@@ -590,6 +599,16 @@ kernel void nd_rasterize_forward_2dgs_kernel(
     float3 pix_color = {0.f, 0.f, 0.f};
     float3 pix_normal = {0.f, 0.f, 0.f};
     float pix_depth = 0.f;
+
+    // Distortion regularizer state (forward.cu lines 397-411).
+    // m = far / (far - near) * (1 - near / depth) — depth normalized to [0, 1].
+    // M1 = Σ m * w_i,  M2 = Σ m^2 * w_i,  distortion = Σ (m^2 A + M2 - 2 m M1) w_i
+    float M1 = 0.f;
+    float M2 = 0.f;
+    float distortion = 0.f;
+    float median_depth = 0.f;
+    int median_contributor = -1;
+
     int last_contributor = range.x - 1;
     bool done = false;
 
@@ -633,8 +652,6 @@ kernel void nd_rasterize_forward_2dgs_kernel(
             const float rho3d = uv.x * uv.x + uv.y * uv.y;
 
             // Low-pass filter: bound by squared screen-space distance.
-            // Caps the surfel's screen footprint at ~FILTER_SIZE pixels to avoid
-            // aliasing when the surfel is viewed nearly edge-on (paper Eq. 7).
             const float2 xy = xy_batch[t];
             const float2 d_screen = float2(xy.x - px, xy.y - py);
             const float rho2d = FILTER_INV_SQ_2DGS * (d_screen.x * d_screen.x + d_screen.y * d_screen.y);
@@ -642,13 +659,13 @@ kernel void nd_rasterize_forward_2dgs_kernel(
 
             // Per-pixel depth at the ray-plane intersection (forward.cu line 369).
             const float depth = uv.x * Tw.x + uv.y * Tw.y + Tw.z;
-            if (depth < 0.2f) continue;  // near_n cutoff (auxiliary.h:37)
+            if (depth < NEAR_N_2DGS) continue;
 
             const float power = -0.5f * rho;
-            if (power > 0.0f) continue;  // surfel evaluated past its 3-sigma support
+            if (power > 0.0f) continue;
 
             const float4 nor_o = normal_opac_batch[t];
-            const float opac = nor_o.w;  // already sigmoid'd by the packer
+            const float opac = nor_o.w;
             const float alpha = min(0.99f, opac * exp(power));
             if (alpha < 1.0f / 255.0f) continue;
 
@@ -660,11 +677,27 @@ kernel void nd_rasterize_forward_2dgs_kernel(
             }
 
             const float w = alpha * T;
-            // RGB accumulation (same as 3DGS path).
+
+            // Distortion regularizer state — accumulate BEFORE updating M1/M2
+            // so the cross-term uses the prior partial sums (matches Eq. in
+            // 2DGS paper appendix and forward.cu lines 400-405).
+            const float A = 1.f - T;
+            const float m = FAR_N_2DGS / (FAR_N_2DGS - NEAR_N_2DGS) * (1.f - NEAR_N_2DGS / depth);
+            distortion += (m * m * A + M2 - 2.f * m * M1) * w;
+            M1 = fma(m, w, M1);
+            M2 = fma(m * m, w, M2);
+
+            // Median: capture the first surfel that pushes T below 0.5.
+            if (T > 0.5f) {
+                median_depth = depth;
+                median_contributor = batch_start + t;
+            }
+
+            // RGB accumulation
             pix_color = fma(rgbs_batch[t], w, pix_color);
-            // Alpha-weighted depth (forward.cu line 403).
+            // Alpha-weighted depth (DEPTH_OFFSET output).
             pix_depth = fma(depth, w, pix_depth);
-            // Alpha-weighted world-space normal (forward.cu line 413).
+            // Alpha-weighted world-space normal (NORMAL_OFFSET output).
             pix_normal = fma(float3(nor_o.x, nor_o.y, nor_o.z), w, pix_normal);
 
             T = next_T;
@@ -673,8 +706,13 @@ kernel void nd_rasterize_forward_2dgs_kernel(
     }
 
     if (inside) {
-        final_Ts[pix_id] = T;
-        final_index[pix_id] = last_contributor;
+        // final_Ts now packs (T, M1, M2) as float3 per pixel.
+        final_Ts[3 * pix_id + 0] = T;
+        final_Ts[3 * pix_id + 1] = M1;
+        final_Ts[3 * pix_id + 2] = M2;
+        // final_index now packs (last_contributor, median_contributor) as int2 per pixel.
+        final_index[2 * pix_id + 0] = last_contributor;
+        final_index[2 * pix_id + 1] = median_contributor;
 
         // Color: composite with background, saturate to [0, 1].
         float3 bg = float3(background[0], background[1], background[2]);
@@ -686,10 +724,15 @@ kernel void nd_rasterize_forward_2dgs_kernel(
         // Depth: alpha-weighted accumulation. Background contributes 0.
         out_depth[pix_id] = pix_depth;
 
-        // Normal: alpha-weighted world-space accumulation. Background contributes 0.
+        // Normal: alpha-weighted world-space accumulation.
         out_normal[3 * pix_id + 0] = pix_normal.x;
         out_normal[3 * pix_id + 1] = pix_normal.y;
         out_normal[3 * pix_id + 2] = pix_normal.z;
+
+        // Aux outputs for backward replay + regularizer losses (M2.1).
+        out_alpha[pix_id]        = 1.f - T;
+        out_median_depth[pix_id] = median_depth;
+        out_distortion[pix_id]   = distortion;
     }
 }
 
