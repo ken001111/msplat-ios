@@ -206,20 +206,34 @@ int main(int argc, char *argv[]) {
             return 0;
         }
 
-        // Training is disabled in this build — the 3DGS train_step was retired
-        // in the Phase 2b cleanup, and the 2DGS backward port + train_step land
-        // in Milestone 2. The remaining CLI surface is render/eval against a
-        // pre-trained scene loaded via --resume, plus the inference helpers
-        // (--render-only, --dump-init-scales). Anything that hit the training
-        // loop now errors clearly.
-        if (resume.empty()) {
-            throw std::runtime_error(
-                "msplat: training is not available in this build (Phase 2b cleanup; "
-                "2DGS backward port pending in Milestone 2). Use --resume <PLY> for "
-                "evaluation against a pre-trained scene, or --render-only <PLY> for "
-                "single-camera inference.");
+        // M2.6: 2DGS training loop restored. The deleted 3DGS BENCHMARK
+        // harness + --val-render + --save-every will be re-added if needed.
+        std::vector<size_t> camIndices(cams.size());
+        std::iota(camIndices.begin(), camIndices.end(), 0);
+        InfiniteRandomIterator<size_t> camsIter(camIndices);
+
+        size_t step = 1;
+        if (!resume.empty()) step = model.loadPly(resume) + 1;
+
+        auto train_t0 = std::chrono::high_resolution_clock::now();
+        for (; step <= (size_t)numIters; step++) {
+            Camera &cam = cams[camsIter.next()];
+            MTensor gt = cam.getGPUImage(model.getDownscaleFactor(step));
+            float loss = model.fullIteration(cam, step, gt, ssimWeight);
+            model.schedulersStep(step);
+            model.afterTrain(step);
+            msplat_commit();
+
+            if (step == 1 || step % 100 == 0 || step == (size_t)numIters) {
+                msplat_gpu_sync();
+                std::cout << "  iter " << std::setw(6) << step
+                          << "  loss=" << std::fixed << std::setprecision(6) << loss
+                          << "  N=" << model.means.size(0) << std::endl;
+            }
         }
-        model.loadPly(resume);
+        auto train_t1 = std::chrono::high_resolution_clock::now();
+        double train_s = std::chrono::duration_cast<std::chrono::milliseconds>(train_t1 - train_t0).count() / 1000.0;
+        std::cout << "Training done in " << train_s << "s (" << numIters << " iters)" << std::endl;
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene, numIters);

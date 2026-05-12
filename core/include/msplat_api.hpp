@@ -38,6 +38,7 @@ struct Stats {
     int iteration = 0;
     int splatCount = 0;
     float msPerStep = 0.0f;
+    float loss = 0.0f;     // M2.6: scalar L1+distortion loss from fullIteration
 };
 
 struct EvalMetrics {

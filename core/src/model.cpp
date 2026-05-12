@@ -543,5 +543,65 @@ MTensor Model::render(Camera& cam, int step){
         opacities, backgroundColor);
 }
 
-// Model::fullIteration removed — 3DGS training retired in Phase 2b cleanup.
-// 2DGS train_step lands in Milestone 2.
+// M2.6: 2DGS training step. Calls msplat_train_step_2dgs to compute the
+// forward + loss + per-gaussian gradients, then runs fused_adam on each
+// of the 6 parameter groups. Returns the scalar loss for caller reporting.
+float Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
+    auto s = prepareCam(cam, step);
+    lastHeight = s.height; lastWidth = s.width;
+    int numPoints = means.size(0);
+
+    adam_step_count++;
+    float bc1 = 1.0f - std::pow(adam_beta1, adam_step_count);
+    float bc2 = 1.0f - std::pow(adam_beta2, adam_step_count);
+
+    if (!xysGradNorm.defined()) {
+        xysGradNorm = gpu_zeros({numPoints}, DType::Float32);
+        visCounts = gpu_zeros({numPoints}, DType::Float32);
+        max2DSize = gpu_zeros({numPoints}, DType::Float32);
+    }
+
+    // Forward + loss + backward — produces per-gaussian gradients in g_tcache.
+    auto [radii_out, loss_val] = msplat_train_step_2dgs(
+        numPoints, means, scales, 1.0f,
+        quats, cam.cachedViewMat, cam.cachedProjViewMat,
+        s.fx, s.fy, s.cx, s.cy,
+        s.height, s.width, s.tileBounds, 0.01f,
+        s.degree, s.degreesToUse, s.cam_pos,
+        featuresDc, featuresRest, opacities, backgroundColor,
+        gt, (int)featuresRest.size(-2),
+        1.0f - ssimWeight,   // lambda_l1
+        0.0f                 // lambda_dist: enable later when training is stable
+    );
+    radii = radii_out;
+
+    // Adam: step each of 6 param groups with the gradients from g_tcache.
+    // Param→grad mapping (matches the order setupOptimizers uses):
+    //   0 means      ← dL_dmean3D
+    //   1 scales     ← dL_dscale
+    //   2 quats      ← dL_dquat
+    //   3 featuresDc ← dL_dfeatures_dc
+    //   4 featuresRest ← dL_dfeatures_rest
+    //   5 opacities  ← dL_dopacity
+    MTensor *params[N_ADAM_GROUPS] = {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities};
+    MTensor grads[N_ADAM_GROUPS] = {
+        msplat_last_dL_dmean3D(),
+        msplat_last_dL_dscale(),
+        msplat_last_dL_dquat(),
+        msplat_last_dL_dfeatures_dc(),
+        msplat_last_dL_dfeatures_rest(),
+        msplat_last_dL_dopacity(),
+    };
+    float bc2_sqrt = std::sqrt(bc2);
+    for (int g = 0; g < N_ADAM_GROUPS; g++) {
+        uint32_t n = (uint32_t)params[g]->numel();
+        float step_size = adam_lr[g] / bc1;
+        msplat_fused_adam(
+            *params[g], grads[g],
+            adam_exp_avg[g], adam_exp_avg_sq[g],
+            n, step_size, adam_beta1, adam_beta2,
+            bc2_sqrt, adam_eps);
+    }
+
+    return loss_val;
+}

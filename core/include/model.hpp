@@ -47,8 +47,9 @@ struct Model{
     float cam_pos[3];
   };
   CamSetup prepareCam(Camera& cam, int step);
-  // fullIteration removed — 3DGS training path retired in Phase 2b cleanup.
-  // 2DGS train_step lands in Milestone 2.
+  // Returns scalar loss value for the iteration. M2.6: re-introduced on the
+  // 2DGS-only train_step (msplat_train_step_2dgs + 6× fused_adam).
+  float fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
   MTensor render(Camera& cam, int step);
 
   MTensor means;

@@ -703,6 +703,31 @@ MTensor msplat_last_out_alpha()        { return g_tcache.out_alpha; }
 MTensor msplat_last_out_median_depth() { return g_tcache.out_median_depth; }
 MTensor msplat_last_out_distortion()   { return g_tcache.out_distortion; }
 
+// M2.6: dispatch fused_adam_kernel on one parameter group.
+void msplat_fused_adam(
+    MTensor &params, MTensor &grads,
+    MTensor &exp_avg, MTensor &exp_avg_sq,
+    uint32_t n,
+    float step_size, float beta1, float beta2,
+    float bc2_sqrt, float eps
+) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->fused_adam_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+        [enc setComputePipelineState:ctx->fused_adam_kernel_cpso];
+        ENC_BUF(enc, params, 0); ENC_BUF(enc, grads, 1);
+        ENC_BUF(enc, exp_avg, 2); ENC_BUF(enc, exp_avg_sq, 3);
+        ENC_SCALAR(enc, step_size, 4);
+        ENC_SCALAR(enc, beta1, 5); ENC_SCALAR(enc, beta2, 6);
+        ENC_SCALAR(enc, bc2_sqrt, 7); ENC_SCALAR(enc, eps, 8);
+        ENC_SCALAR(enc, n, 9);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
 // M2.3/M2.4 per-gaussian gradient accessors.
 MTensor msplat_last_dL_dmean3D()        { return g_tcache.dL_dmean3D; }
 MTensor msplat_last_dL_dscale()         { return g_tcache.dL_dscale; }

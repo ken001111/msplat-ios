@@ -58,6 +58,16 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
     MTensor &gt, int features_rest_bases,
     float lambda_l1, float lambda_dist);
 
+// M2.6: dispatch fused_adam_kernel on a single parameter group. Sized in
+// flat float count; for [N, K] tensors pass n = N*K. Asynchronous — caller
+// is expected to msplat_commit + msplat_gpu_sync at end-of-iter.
+void msplat_fused_adam(
+    MTensor &params, MTensor &grads,
+    MTensor &exp_avg, MTensor &exp_avg_sq,
+    uint32_t n,
+    float step_size, float beta1, float beta2,
+    float bc2_sqrt, float eps);
+
 // M2.3/M2.4 per-gaussian gradient accessors — read by Model::fullIteration
 // to feed into fused_adam_kernel (M2.6).
 MTensor msplat_last_dL_dmean3D();
