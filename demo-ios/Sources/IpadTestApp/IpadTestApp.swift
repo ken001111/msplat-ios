@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 import QuartzCore
 import Msplat
 
@@ -71,7 +72,7 @@ final class Engine: ObservableObject {
             autoreleasepool {
                 let dataset = GaussianDataset(path: datasetPath)
                 var config = TrainingConfig()
-                config.iterations = iterations
+                config.iterations = Int32(iterations)
                 config.numDownscales = 0
                 config.bgColor = (0, 0, 0)
                 let trainer = GaussianTrainer(dataset: dataset, config: config)
