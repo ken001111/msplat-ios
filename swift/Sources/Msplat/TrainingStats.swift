@@ -5,11 +5,13 @@ public struct TrainingStats {
     public let iteration: Int
     public let splatCount: Int
     public let msPerStep: Float
+    public let loss: Float          // M2.6: scalar loss for the iteration
 
     init(from c: MsplatStats) {
         self.iteration = Int(c.iteration)
         self.splatCount = Int(c.splatCount)
         self.msPerStep = c.msPerStep
+        self.loss = c.loss
     }
 }
 

@@ -329,7 +329,7 @@ void msplat_trainer_destroy(MsplatTrainer t) {
 
 MsplatStats msplat_trainer_step(MsplatTrainer t) {
     auto stats = static_cast<msplat::Trainer*>(t)->step();
-    return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep};
+    return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep, stats.loss};
 }
 
 void msplat_trainer_train(MsplatTrainer t) {
