@@ -676,6 +676,36 @@ Model::VoxelGrid Model::makeVoxelGrid(const std::vector<Camera> &cameras,
     return g;
 }
 
+// Phase 2c.2: fuse each rendered camera into the voxel grid in-place.
+void Model::integrateTSDF(VoxelGrid &grid, std::vector<Camera> &cameras,
+                          int step, float truncDist, float alphaThresh) {
+    for (auto &cam : cameras) {
+        // Render to populate g_tcache.out_depth + .out_alpha + .cachedViewMat.
+        render(cam, step);
+        msplat_gpu_sync();
+
+        // Downscaled intrinsics (must match the rendered buffer dimensions).
+        const float sf = getDownscaleFactor(step);
+        const float fx = cam.fx / sf, fy = cam.fy / sf;
+        const float cx = cam.cx / sf, cy = cam.cy / sf;
+        const uint32_t W = static_cast<uint32_t>(cam.width  / sf);
+        const uint32_t H = static_cast<uint32_t>(cam.height / sf);
+
+        MTensor depthBuf = msplat_last_out_depth();
+        MTensor alphaBuf = msplat_last_out_alpha();
+        msplat_tsdf_integrate(
+            grid.data,
+            grid.dims[0], grid.dims[1], grid.dims[2],
+            grid.origin[0], grid.origin[1], grid.origin[2],
+            grid.voxelSize,
+            cam.cachedViewMat,
+            fx, fy, cx, cy, W, H,
+            truncDist, alphaThresh,
+            depthBuf, alphaBuf);
+    }
+    msplat_gpu_sync();
+}
+
 // M2.6: 2DGS training step. Calls msplat_train_step_2dgs to compute the
 // forward + loss + per-gaussian gradients, then runs fused_adam on each
 // of the 6 parameter groups. Returns the scalar loss for caller reporting.

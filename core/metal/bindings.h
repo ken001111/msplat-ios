@@ -58,6 +58,22 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
     MTensor &gt, int features_rest_bases,
     float lambda_l1, float lambda_dist);
 
+// Phase 2c.2: integrate one rendered depth+alpha map into the TSDF voxel grid.
+// One Metal thread per voxel; the dispatch is synchronous so multiple calls
+// can be chained for multi-camera fusion without atomics.
+void msplat_tsdf_integrate(
+    MTensor &grid,                  // [Dz, Dy, Dx, 2] Float32 (sdf, weight) in-place
+    int Dx, int Dy, int Dz,
+    float origin_x, float origin_y, float origin_z,
+    float voxelSize,
+    MTensor &viewmat,               // 4x4 row-major
+    float fx, float fy, float cx, float cy,
+    uint32_t imgW, uint32_t imgH,
+    float truncDist,
+    float alphaThresh,
+    MTensor &depthMap,              // [H, W] Float32 (out_depth)
+    MTensor &alphaMap);             // [H, W] Float32 (out_alpha)
+
 // M2.6: dispatch fused_adam_kernel on a single parameter group. Sized in
 // flat float count; for [N, K] tensors pass n = N*K. Asynchronous — caller
 // is expected to msplat_commit + msplat_gpu_sync at end-of-iter.

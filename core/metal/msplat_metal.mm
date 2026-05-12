@@ -137,6 +137,8 @@ struct MetalContext {
     id<MTLComputePipelineState> project_and_sh_backward_2dgs_kernel_cpso;
     // 2DGS training losses (M2.4)
     id<MTLComputePipelineState> loss_l1_distortion_2dgs_kernel_cpso;
+    // TSDF fusion (Phase 2c.2)
+    id<MTLComputePipelineState> tsdf_integrate_kernel_cpso;
     // Tile-local sorting (shared with densify)
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     // Prefix sum (shared with densify)
@@ -232,6 +234,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->project_and_sh_backward_2dgs_kernel_cpso = load(@"project_and_sh_backward_2dgs_kernel");
     // 2DGS training losses (M2.4).
     ctx->loss_l1_distortion_2dgs_kernel_cpso      = load(@"loss_l1_distortion_2dgs_kernel");
+    // TSDF fusion (Phase 2c.2).
+    ctx->tsdf_integrate_kernel_cpso               = load(@"tsdf_integrate_kernel");
     // Tile-local sorting + prefix sum (shared with densify)
     ctx->scatter_to_prealloc_bins_kernel_cpso     = load(@"scatter_to_prealloc_bins_kernel");
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
@@ -706,6 +710,53 @@ MTensor msplat_last_out_normal()       { return g_tcache.out_normal; }
 MTensor msplat_last_out_alpha()        { return g_tcache.out_alpha; }
 MTensor msplat_last_out_median_depth() { return g_tcache.out_median_depth; }
 MTensor msplat_last_out_distortion()   { return g_tcache.out_distortion; }
+
+// Phase 2c.2: integrate one camera's rendered depth+alpha into the TSDF
+// voxel grid. Synchronous so the caller can loop sequentially over cameras
+// without inter-dispatch atomics.
+void msplat_tsdf_integrate(
+    MTensor &grid,
+    int Dx, int Dy, int Dz,
+    float origin_x, float origin_y, float origin_z,
+    float voxelSize,
+    MTensor &viewmat,
+    float fx, float fy, float cx, float cy,
+    uint32_t imgW, uint32_t imgH,
+    float truncDist,
+    float alphaThresh,
+    MTensor &depthMap,
+    MTensor &alphaMap
+) {
+    MetalContext* ctx = get_global_context();
+    auto dims_arr   = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
+        (uint32_t)Dx, (uint32_t)Dy, (uint32_t)Dz, 0xDEAD});
+    auto origin_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{
+        origin_x, origin_y, origin_z, 0.0f});  // 16-byte float3 padding (iOS validator)
+    auto intrins_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{fx, fy, cx, cy});
+    auto imgSize_arr = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{imgW, imgH});
+
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx->tsdf_integrate_kernel_cpso];
+        [enc setBytes:dims_arr->data()    length:sizeof(*dims_arr)    atIndex:0];
+        [enc setBytes:origin_arr->data()  length:sizeof(*origin_arr)  atIndex:1];
+        ENC_SCALAR(enc, voxelSize, 2);
+        ENC_BUF(enc, viewmat, 3);
+        [enc setBytes:intrins_arr->data() length:sizeof(*intrins_arr) atIndex:4];
+        [enc setBytes:imgSize_arr->data() length:sizeof(*imgSize_arr) atIndex:5];
+        ENC_SCALAR(enc, truncDist, 6);
+        ENC_SCALAR(enc, alphaThresh, 7);
+        ENC_BUF(enc, depthMap, 8);
+        ENC_BUF(enc, alphaMap, 9);
+        ENC_BUF(enc, grid, 10);
+        MTLSize tg = MTLSizeMake(8, 8, 4);    // 256 threads per group, good occupancy on Apple GPUs
+        MTLSize grid_size = MTLSizeMake(Dx, Dy, Dz);
+        [enc dispatchThreads:grid_size threadsPerThreadgroup:tg];
+        [enc endEncoding];
+    });
+    ctx->syncCB();
+}
 
 // M2.6: dispatch fused_adam_kernel on one parameter group.
 void msplat_fused_adam(

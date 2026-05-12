@@ -61,6 +61,12 @@ struct Model{
   VoxelGrid makeVoxelGrid(const std::vector<Camera> &cameras,
                           float voxelSize, float boundRadius,
                           int memoryCapMB = 512) const;
+
+  // Phase 2c.2: fuse rendered depth maps from each camera into the voxel
+  // grid (in-place). Truncation distance defaults to 4 × voxelSize (a few
+  // voxels of trust band on either side of each surface sample).
+  void integrateTSDF(VoxelGrid &grid, std::vector<Camera> &cameras,
+                      int step, float truncDist, float alphaThresh);
   int loadCheckpoint(const std::string &filename);
   struct CamSetup {
     float fx, fy, cx, cy;

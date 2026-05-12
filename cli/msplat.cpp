@@ -131,6 +131,20 @@ int main(int argc, char *argv[]) {
     app.add_option("--mesh-bound", meshBound,
         "Half-extent of the voxel grid around the camera centroid, meters (default 0.3)");
 
+    // Phase 2c.2: TSDF fusion. Produces a raw [Dz, Dy, Dx, 2] Float32 dump
+    // (sdf + weight per voxel) — opens in tools like ImageJ / 3D Slicer with
+    // the dims advertised in the --mesh-info banner. Marching Cubes in 2c.3
+    // will consume the in-memory grid directly without round-tripping.
+    std::string exportTSDF;
+    app.add_option("--export-tsdf", exportTSDF,
+        "Run TSDF fusion across all training views, save raw grid (Phase 2c.2)");
+    float meshAlphaThresh = 0.5f;
+    app.add_option("--mesh-alpha-thresh", meshAlphaThresh,
+        "Min accumulated alpha for a pixel to contribute (default 0.5)");
+    float meshTruncMultiplier = 4.0f;
+    app.add_option("--mesh-trunc-voxels", meshTruncMultiplier,
+        "TSDF truncation distance in voxel widths (default 4)");
+
     // Phase 2b.3.2 (6/N) smoke hook: load a PLY (3DGS or 2DGS) and render the
     // first training camera with msplat_render, then exit. Reports min/max/mean
     // and nonzero counts on out_img + the 2DGS side outputs (out_depth /
@@ -274,7 +288,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Phase 2c.1: voxel grid sizing (no fusion yet — that's 2c.2).
-        if (meshInfo) {
+        if (meshInfo || !exportTSDF.empty()) {
             auto grid = model.makeVoxelGrid(cams, meshVoxelSize, meshBound);
             int64_t numVoxels = (int64_t)grid.dims[0] * grid.dims[1] * grid.dims[2];
             std::cout << "\n=== Voxel grid (Phase 2c.1) ===" << std::endl;
@@ -289,6 +303,36 @@ int main(int argc, char *argv[]) {
                       << (grid.dims[2] * grid.voxelSize) << " m" << std::endl;
             std::cout << "  buffer:      " << (numVoxels * 2 * 4) / (1024 * 1024)
                       << " MB (Float32 sdf + weight)" << std::endl;
+
+            // Phase 2c.2: TSDF fusion + raw dump.
+            if (!exportTSDF.empty()) {
+                float truncDist = meshTruncMultiplier * meshVoxelSize;
+                std::cout << "Fusing " << cams.size() << " views (trunc=" << truncDist
+                          << " m, alphaThresh=" << meshAlphaThresh << ")..." << std::endl;
+                auto t0 = std::chrono::high_resolution_clock::now();
+                model.integrateTSDF(grid, cams, (int)numIters, truncDist, meshAlphaThresh);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double s = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() / 1000.0;
+                std::cout << "Fusion done in " << s << "s" << std::endl;
+
+                // Read grid back to CPU + write raw dump.
+                msplat_gpu_sync();
+                MTensor cpu = grid.data.cpu();
+                std::ofstream f(exportTSDF, std::ios::binary);
+                f.write(reinterpret_cast<const char*>(cpu.data<float>()), cpu.nbytes());
+                std::cout << "Wrote " << cpu.nbytes() / (1024 * 1024) << " MB raw grid to "
+                          << exportTSDF << " (layout: [Dz, Dy, Dx, 2] Float32, (sdf, weight))" << std::endl;
+
+                // Diagnostic: count how many voxels got at least one observation.
+                const float *p = cpu.data<float>();
+                int64_t observed = 0, sign_change = 0;
+                for (int64_t i = 0; i < numVoxels; i++) {
+                    float w = p[i*2 + 1];
+                    if (w > 0) observed++;
+                }
+                std::cout << "Voxels observed (weight > 0): " << observed << " / " << numVoxels
+                          << " (" << (100.0 * observed / numVoxels) << "%)" << std::endl;
+            }
         }
 
         // Evaluation

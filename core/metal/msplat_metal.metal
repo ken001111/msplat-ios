@@ -2040,6 +2040,74 @@ kernel void project_and_sh_backward_2dgs_kernel(
     dL_dmean2D[2*idx+1] = dL_dtransMat[base + 7] * depth_fwd * 0.5f * H;
 }
 
+// ===== TSDF fusion (Phase 2c.2) =====
+// Per-voxel integration of one rendered depth map into a [Dz, Dy, Dx, 2] grid.
+// Each voxel's last dim is (sdf, weight). One thread per voxel; one dispatch
+// per camera. Dispatches are serial (no inter-camera concurrency), so the
+// read-modify-write of (sdf, weight) needs no atomics.
+//
+// Math: project voxel center to camera image space using the same viewmat +
+// pinhole intrinsics msplat's project_and_sh_forward_2dgs uses (CV convention,
+// +Z forward in camera frame). Sample the rendered depth at that pixel. SDF
+// is (sampled_mean_depth − voxel_view_z), positive = empty / in front of
+// surface, negative = behind. Truncate at ±trunc. Accumulate weighted by
+// the pixel's accumulated alpha (high-alpha pixels carry more depth info).
+kernel void tsdf_integrate_kernel(
+    constant uint3& dims,                // (Dx, Dy, Dz) voxels per axis
+    constant float3& origin,             // world-space position of voxel (0,0,0) corner
+    constant float& voxelSize,           // edge length, meters
+    constant float* viewmat,             // 4x4 row-major (world → view, CV convention)
+    constant float4& intrins,            // (fx, fy, cx, cy) at the rendered resolution
+    constant uint2& imgSize,             // (W, H) of the depth/alpha buffers
+    constant float& truncDist,           // truncation distance, meters
+    constant float& alphaThresh,         // skip pixels below this accumulated alpha
+    constant float* depthMap,            // [H, W] — out_depth (sum, not mean)
+    constant float* alphaMap,            // [H, W] — out_alpha (= 1 - T_final)
+    device float* grid,                  // [Dz, Dy, Dx, 2] in-place
+    uint3 gp [[thread_position_in_grid]]
+) {
+    if (gp.x >= dims.x || gp.y >= dims.y || gp.z >= dims.z) return;
+
+    // Voxel center in world coords.
+    float3 wp = float3(
+        origin.x + (float(gp.x) + 0.5f) * voxelSize,
+        origin.y + (float(gp.y) + 0.5f) * voxelSize,
+        origin.z + (float(gp.z) + 0.5f) * voxelSize);
+
+    // World → view (row-major viewmat).
+    float view_x = viewmat[0]*wp.x + viewmat[1]*wp.y + viewmat[2]*wp.z + viewmat[3];
+    float view_y = viewmat[4]*wp.x + viewmat[5]*wp.y + viewmat[6]*wp.z + viewmat[7];
+    float view_z = viewmat[8]*wp.x + viewmat[9]*wp.y + viewmat[10]*wp.z + viewmat[11];
+    if (view_z <= 0.01f) return;  // behind / on the camera
+
+    // Pinhole projection.
+    float pix_x = view_x / view_z * intrins.x + intrins.z;
+    float pix_y = view_y / view_z * intrins.y + intrins.w;
+    int ix = (int)pix_x;
+    int iy = (int)pix_y;
+    if (ix < 0 || ix >= (int)imgSize.x || iy < 0 || iy >= (int)imgSize.y) return;
+
+    int pid = iy * (int)imgSize.x + ix;
+    float a = alphaMap[pid];
+    if (a < alphaThresh) return;
+    float depth = depthMap[pid] / a;   // alpha-divide → mean depth
+    if (!isfinite(depth) || depth <= 0.0f) return;
+
+    // SDF in meters. Positive if voxel is between camera and surface.
+    float sdf = depth - view_z;
+    if (sdf < -truncDist) return;       // far behind surface, no info
+    sdf = clamp(sdf, -truncDist, truncDist);
+
+    // Voxel buffer index (matches host C++ shape [Dz, Dy, Dx, 2]).
+    uint vid = ((gp.z * dims.y + gp.y) * dims.x + gp.x) * 2u;
+    float old_sdf = grid[vid + 0];
+    float old_w   = grid[vid + 1];
+    float w       = a;
+    float new_w   = old_w + w;
+    grid[vid + 0] = (old_sdf * old_w + sdf * w) / new_w;
+    grid[vid + 1] = new_w;
+}
+
 // ===== 2DGS training losses (M2.4) =====
 // Minimal first-pass: L1 image loss + depth-distortion regularizer. SSIM and
 // normal-consistency are deferred — they add ~150 lines each and aren't
