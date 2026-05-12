@@ -716,6 +716,171 @@ kernel void nd_rasterize_forward_kernel(
     }
 }
 
+// ===== 2DGS forward rasterizer (Phase 2b.3.1, step 3) =====
+// Port of hbb1/2d-gaussian-splatting renderCUDA (forward.cu:256-457). Replaces
+// the per-pixel screen-space conic sigma with a ray-plane intersection in the
+// surfel's tangent frame; outputs an extra depth map and an alpha-weighted
+// world-space normal map (out_others in the reference, split here for cleaner
+// buffer allocation).
+//
+// Compositing logic (1/255 alpha cutoff, T < 1e-4 early exit) is identical to
+// the 3DGS path — only the per-gaussian (u, v, depth) recovery differs.
+//
+// Inference-scope: this kernel does NOT yet accumulate the distortion / median-
+// depth side outputs needed by the 2DGS regularizers (Phase 2b.4). Adding them
+// is mechanical once training works.
+//
+// Like project_and_sh_forward_2dgs_kernel, this is dead code until the host
+// dispatcher and the bitonic-sort packer learn about transMat / normal_opacity.
+kernel void nd_rasterize_forward_2dgs_kernel(
+    constant uint3& tile_bounds,
+    constant uint3& img_size,
+    constant uint& channels,
+    constant int* tile_bins,                // int2 (start, end) per tile
+    constant float* packed_xy,              // float2 per sorted-gaussian — surfel center
+    constant float* packed_normal_opac,     // float4 per sorted-gaussian — (n.x, n.y, n.z, sigmoid(opac))
+    constant float* packed_transmat,        // 9 floats per sorted-gaussian — 3 rows of T
+    constant float* packed_rgb,             // float3 per sorted-gaussian — raw SH output (NOT clamped)
+    device float* final_Ts,
+    device int* final_index,
+    device float* out_img,                  // float3 per pixel (RGB)
+    device float* out_depth,                // float per pixel — alpha-weighted depth
+    device float* out_normal,               // float3 per pixel — alpha-weighted world-space normal
+    constant float* background,
+    constant uint2& blockDim,
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    float px = (float)j;
+    float py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    // Threadgroup shared memory: per-surfel state for one batch.
+    // 64 surfels × (xy + normal_opac + Tu + Tv + Tw + rgb) ≈ 5.5 KB,
+    // well under Apple GPU family 8/9 threadgroup-memory limits.
+    threadgroup float2 xy_batch[RAST_BLOCK_SIZE];
+    threadgroup float4 normal_opac_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 Tu_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 Tv_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 Tw_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float3 pix_color = {0.f, 0.f, 0.f};
+    float3 pix_normal = {0.f, 0.f, 0.f};
+    float pix_depth = 0.f;
+    int last_contributor = range.x - 1;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx_load = batch_start + (int)tr;
+        if (idx_load < range.y) {
+            xy_batch[tr]            = read_packed_float2(packed_xy, idx_load);
+            normal_opac_batch[tr]   = read_packed_float4(packed_normal_opac, idx_load);
+            // Read T as 3 contiguous float3 rows from the packed transmat buffer.
+            uint t_base = (uint)idx_load * 9;
+            Tu_batch[tr] = float3(packed_transmat[t_base + 0], packed_transmat[t_base + 1], packed_transmat[t_base + 2]);
+            Tv_batch[tr] = float3(packed_transmat[t_base + 3], packed_transmat[t_base + 4], packed_transmat[t_base + 5]);
+            Tw_batch[tr] = float3(packed_transmat[t_base + 6], packed_transmat[t_base + 7], packed_transmat[t_base + 8]);
+            // packed_rgb stores the raw SH output (pre-clamp), matches 3DGS path
+            const float3 raw_c = read_packed_float3(packed_rgb, idx_load);
+            rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done || !inside) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+
+        for (int t = 0; t < batch_size; ++t) {
+            // Build two homogeneous planes from T's rows. (forward.cu Eq. 8)
+            const float3 Tu = Tu_batch[t];
+            const float3 Tv = Tv_batch[t];
+            const float3 Tw = Tw_batch[t];
+            const float3 k = px * Tw - Tu;
+            const float3 l = py * Tw - Tv;
+            // Their cross product is the ray; perspective-divide → (u, v).
+            const float3 ray = cross(k, l);
+            if (ray.z == 0.0f) continue;
+            const float inv_z = 1.0f / ray.z;
+            const float2 uv = float2(ray.x * inv_z, ray.y * inv_z);
+
+            // 2DGS sigma — squared distance in the tangent frame (Eq. 10).
+            const float rho3d = uv.x * uv.x + uv.y * uv.y;
+
+            // Low-pass filter: bound by squared screen-space distance.
+            // Caps the surfel's screen footprint at ~FILTER_SIZE pixels to avoid
+            // aliasing when the surfel is viewed nearly edge-on (paper Eq. 7).
+            const float2 xy = xy_batch[t];
+            const float2 d_screen = float2(xy.x - px, xy.y - py);
+            const float rho2d = FILTER_INV_SQ_2DGS * (d_screen.x * d_screen.x + d_screen.y * d_screen.y);
+            const float rho = min(rho3d, rho2d);
+
+            // Per-pixel depth at the ray-plane intersection (forward.cu line 369).
+            const float depth = uv.x * Tw.x + uv.y * Tw.y + Tw.z;
+            if (depth < 0.2f) continue;  // near_n cutoff (auxiliary.h:37)
+
+            const float power = -0.5f * rho;
+            if (power > 0.0f) continue;  // surfel evaluated past its 3-sigma support
+
+            const float4 nor_o = normal_opac_batch[t];
+            const float opac = nor_o.w;  // already sigmoid'd by the packer
+            const float alpha = min(0.99f, opac * exp(power));
+            if (alpha < 1.0f / 255.0f) continue;
+
+            const float next_T = T * (1.0f - alpha);
+            if (next_T <= 1e-4f) {
+                last_contributor = batch_start + t - 1;
+                done = true;
+                break;
+            }
+
+            const float w = alpha * T;
+            // RGB accumulation (same as 3DGS path).
+            pix_color = fma(rgbs_batch[t], w, pix_color);
+            // Alpha-weighted depth (forward.cu line 403).
+            pix_depth = fma(depth, w, pix_depth);
+            // Alpha-weighted world-space normal (forward.cu line 413).
+            pix_normal = fma(float3(nor_o.x, nor_o.y, nor_o.z), w, pix_normal);
+
+            T = next_T;
+            last_contributor = batch_start + t;
+        }
+    }
+
+    if (inside) {
+        final_Ts[pix_id] = T;
+        final_index[pix_id] = last_contributor;
+
+        // Color: composite with background, saturate to [0, 1].
+        float3 bg = float3(background[0], background[1], background[2]);
+        float3 final_rgb = saturate(fma(bg, T, pix_color));
+        out_img[CHANNELS * pix_id + 0] = final_rgb.x;
+        out_img[CHANNELS * pix_id + 1] = final_rgb.y;
+        out_img[CHANNELS * pix_id + 2] = final_rgb.z;
+
+        // Depth: alpha-weighted accumulation. Background contributes 0.
+        out_depth[pix_id] = pix_depth;
+
+        // Normal: alpha-weighted world-space accumulation. Background contributes 0.
+        out_normal[3 * pix_id + 0] = pix_normal.x;
+        out_normal[3 * pix_id + 1] = pix_normal.y;
+        out_normal[3 * pix_id + 2] = pix_normal.z;
+    }
+}
+
 void sh_coeffs_to_color(
     const uint degree,
     const float3 viewdir,
