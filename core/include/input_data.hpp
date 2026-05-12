@@ -57,4 +57,11 @@ struct InputData {
 // Auto-detect format and load dataset
 InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath = "");
 
+// Populate `data.points` with `numPoints` uniformly random samples in
+// [-extent, extent]^3. Used as a fallback when no SfM point cloud is provided.
+// Mirrors the random-init behavior in graphdeco-inria/3DGS and hbb1/2DGS, which
+// the Colab pipeline relies on. Coordinates are in the post-autoScaleAndCenter
+// frame, so extent ≈ 1.3 covers a scene normalized to camera-radius ≈ 1.
+void initializeRandomPoints(InputData &data, int64_t numPoints = 100000, float extent = 1.3f);
+
 #endif

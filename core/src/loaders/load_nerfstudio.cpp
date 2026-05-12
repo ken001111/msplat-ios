@@ -22,7 +22,11 @@ InputData loaders::loadNerfstudio(const std::string &projectRoot) {
     // Global defaults (overridden per-frame if present)
     int gW = j.value("w", 0), gH = j.value("h", 0);
     float gFx = j.value("fl_x", 0.0f), gFy = j.value("fl_y", 0.0f);
-    float gCx = j.value("cx", 0.0f), gCy = j.value("cy", 0.0f);
+    // cx/cy default to image center if absent — matches Polycam loader and the
+    // Nerfstudio/3DGS convention where principal point is assumed at the center
+    // when not specified. iOS ARKit captures fall into this case.
+    float gCx = j.value("cx", gW > 0 ? gW * 0.5f : 0.0f);
+    float gCy = j.value("cy", gH > 0 ? gH * 0.5f : 0.0f);
     float gK1 = j.value("k1", 0.0f), gK2 = j.value("k2", 0.0f), gK3 = j.value("k3", 0.0f);
     float gP1 = j.value("p1", 0.0f), gP2 = j.value("p2", 0.0f);
 

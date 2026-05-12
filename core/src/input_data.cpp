@@ -195,23 +195,48 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs) const {
     f << arr.dump(2);
 }
 
+// ── Random point cloud init (fallback when no SfM points present) ───────────
+
+void initializeRandomPoints(InputData &data, int64_t numPoints, float extent) {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> distXyz(-extent, extent);
+    std::uniform_int_distribution<int> distRgb(0, 255);
+
+    data.points.xyz.resize(numPoints * 3);
+    data.points.rgb.resize(numPoints * 3);
+    for (int64_t i = 0; i < numPoints; i++) {
+        data.points.xyz[i*3+0] = distXyz(rng);
+        data.points.xyz[i*3+1] = distXyz(rng);
+        data.points.xyz[i*3+2] = distXyz(rng);
+        data.points.rgb[i*3+0] = (uint8_t)distRgb(rng);
+        data.points.rgb[i*3+1] = (uint8_t)distRgb(rng);
+        data.points.rgb[i*3+2] = (uint8_t)distRgb(rng);
+    }
+    data.points.count = numPoints;
+}
+
 // ── Format dispatcher ───────────────────────────────────────────────────────
 
 InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
     fs::path root(path);
 
-    // Nerfstudio: transforms.json
-    if (fs::exists(root / "transforms.json"))
-        return loaders::loadNerfstudio(path);
+    InputData data;
+    if (fs::exists(root / "transforms.json")) {
+        data = loaders::loadNerfstudio(path);
+    } else if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin")) {
+        data = loaders::loadColmap(path, colmapImagePath);
+    } else if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json")) {
+        data = loaders::loadPolycam(path);
+    } else {
+        throw std::runtime_error("Unrecognized dataset format in: " + path +
+            "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+    }
 
-    // COLMAP: cameras.bin (direct or in sparse/0/)
-    if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin"))
-        return loaders::loadColmap(path, colmapImagePath);
+    if (data.points.count == 0) {
+        std::cerr << "msplat: no SfM point cloud found, seeding 100k random points "
+                     "(matches 3DGS/2DGS default behavior)\n";
+        initializeRandomPoints(data);
+    }
 
-    // Polycam: keyframes/ directory or cameras.json
-    if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json"))
-        return loaders::loadPolycam(path);
-
-    throw std::runtime_error("Unrecognized dataset format in: " + path +
-        "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+    return data;
 }

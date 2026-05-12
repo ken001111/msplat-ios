@@ -25,6 +25,23 @@ message(STATUS "msplat ${DAPP_VERSION}")
 add_compile_options("-DAPP_VERSION=\"${DAPP_VERSION}\"")
 add_compile_options("-DAPP_REVISION=\"${DAPP_REVISION}\"")
 
+# --- Platform detection ---
+# MSPLAT_METAL_SDK selects which Apple SDK to compile Metal kernels against.
+# Default: macosx. For iOS support set to "iphoneos" or "iphonesimulator".
+if(NOT DEFINED MSPLAT_METAL_SDK)
+    set(MSPLAT_METAL_SDK "macosx")
+endif()
+message(STATUS "msplat Metal SDK: ${MSPLAT_METAL_SDK}")
+
+# When CMAKE_SYSTEM_NAME is iOS, CMake configures iOS-specific build flags.
+# This is typically set by passing -DCMAKE_SYSTEM_NAME=iOS on the cmake command line
+# or by using -G Xcode with iOS toolchain.
+set(MSPLAT_IS_IOS FALSE)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(MSPLAT_IS_IOS TRUE)
+    message(STATUS "Building for iOS")
+endif()
+
 # --- Dependencies ---
 
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
@@ -39,11 +56,17 @@ set(NANOFLANN_BUILD_EXAMPLES OFF)
 set(NANOFLANN_BUILD_TESTS OFF)
 FetchContent_Declare(nanoflann
     URL https://github.com/jlblancoc/nanoflann/archive/refs/tags/v1.5.5.zip)
-FetchContent_Declare(cli11
-    URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip)
-FetchContent_MakeAvailable(nlohmann_json nanoflann cli11)
 
-# Metal frameworks
+# CLI11 is only needed for the macOS CLI binary.
+if(NOT MSPLAT_IS_IOS)
+    FetchContent_Declare(cli11
+        URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip)
+    FetchContent_MakeAvailable(nlohmann_json nanoflann cli11)
+else()
+    FetchContent_MakeAvailable(nlohmann_json nanoflann)
+endif()
+
+# Apple frameworks (available on both macOS and iOS).
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(METALKIT_FRAMEWORK MetalKit REQUIRED)
@@ -58,16 +81,16 @@ set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
 add_custom_command(
     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-    COMMAND xcrun -sdk macosx metal -O3 -c
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 -c
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
-    COMMAND xcrun -sdk macosx metallib
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
     DEPENDS ${METAL_SOURCE}
-    COMMENT "Compiling Metal kernels → default.metallib"
+    COMMENT "Compiling Metal kernels (${MSPLAT_METAL_SDK}) -> default.metallib"
 )
 add_custom_target(metallib ALL
     DEPENDS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib)
@@ -104,22 +127,24 @@ target_link_libraries(msplat_core PUBLIC
 target_compile_definitions(msplat_core PRIVATE USE_MPS)
 add_dependencies(msplat_core metallib)
 
-# --- CLI binary ---
+# --- CLI binary (macOS only; iOS apps don't have command-line targets) ---
 
-add_executable(msplat cli/msplat.cpp)
-target_link_libraries(msplat PRIVATE
-    msplat_core
-    CLI11::CLI11
-    pthread
-)
-target_compile_definitions(msplat PRIVATE USE_MPS)
-install(TARGETS msplat DESTINATION bin)
+if(NOT MSPLAT_IS_IOS)
+    add_executable(msplat cli/msplat.cpp)
+    target_link_libraries(msplat PRIVATE
+        msplat_core
+        CLI11::CLI11
+        pthread
+    )
+    target_compile_definitions(msplat PRIVATE USE_MPS)
+    install(TARGETS msplat DESTINATION bin)
+endif()
 
-# --- Python bindings (optional, enabled when building via scikit-build-core) ---
+# --- Python bindings (macOS only; iOS doesn't run CPython) ---
 
 option(MSPLAT_BUILD_PYTHON "Build nanobind Python bindings" OFF)
 
-if(MSPLAT_BUILD_PYTHON)
+if(MSPLAT_BUILD_PYTHON AND NOT MSPLAT_IS_IOS)
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
     find_package(nanobind CONFIG REQUIRED)
 
