@@ -126,18 +126,85 @@ struct ContentView: View {
     @State private var iterations: Int = 200
 
     private var datasetPath: String? {
-        let bundle = Bundle.main
-        // Folder-reference case (Xcode "Create folder references" radio).
-        if let url = bundle.url(forResource: "Scan_recent", withExtension: nil),
-           FileManager.default.fileExists(atPath: url.appendingPathComponent("transforms.json").path) {
-            return url.path
+        // Xcode 26 dropped "Create folder references" from the Add-Files dialog.
+        // "Create folders" (synchronized) flattens nested subdirectories when
+        // copying into the .app bundle, so transforms.json ends up at the
+        // bundle root but `images/foo.jpg` references don't resolve.
+        //
+        // Workaround: at first launch, scan the bundle for the needed files
+        // and copy them into the writable Documents directory with the
+        // canonical Scan_recent/{transforms.json, images/, masks/} layout.
+        // msplat then loads from there.
+        return Self.prepareDatasetInDocuments()
+    }
+
+    private static var preparedDatasetPath: String? = nil
+
+    private static func prepareDatasetInDocuments() -> String? {
+        if let cached = preparedDatasetPath { return cached }
+
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let target = docs.appendingPathComponent("Scan_recent", isDirectory: true)
+        let imagesDir = target.appendingPathComponent("images", isDirectory: true)
+        let masksDir = target.appendingPathComponent("masks", isDirectory: true)
+        let txDest = target.appendingPathComponent("transforms.json")
+
+        // Idempotent: if already laid out, reuse.
+        if fm.fileExists(atPath: txDest.path),
+           let imgs = try? fm.contentsOfDirectory(at: imagesDir, includingPropertiesForKeys: nil),
+           !imgs.isEmpty {
+            preparedDatasetPath = target.path
+            return target.path
         }
-        // Fallback for Xcode 26's "Create synchronized folders" / flattened layout —
-        // find transforms.json wherever it landed and use its parent as the dataset.
-        if let tx = bundle.url(forResource: "transforms", withExtension: "json") {
-            return tx.deletingLastPathComponent().path
+
+        // Locate transforms.json in the bundle (Bundle.main searches recursively).
+        guard let bundleTx = Bundle.main.url(forResource: "transforms", withExtension: "json") else {
+            print("Plan B: transforms.json not found in app bundle.")
+            return nil
         }
-        return nil
+
+        // Build target tree under Documents/.
+        try? fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: masksDir, withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: txDest.path) {
+            try? fm.copyItem(at: bundleTx, to: txDest)
+        }
+
+        // Sweep the bundle for jpg/png files and route them by extension.
+        // Whatever directory layout Xcode produced, we flatten + re-layout here.
+        var jpgCount = 0, pngCount = 0
+        if let walker = fm.enumerator(at: Bundle.main.bundleURL,
+                                      includingPropertiesForKeys: nil,
+                                      options: [.skipsHiddenFiles]) {
+            for case let url as URL in walker {
+                let ext = url.pathExtension.lowercased()
+                let name = url.lastPathComponent
+                if ext == "jpg" || ext == "jpeg" {
+                    let dest = imagesDir.appendingPathComponent(name)
+                    if !fm.fileExists(atPath: dest.path) {
+                        try? fm.copyItem(at: url, to: dest)
+                    }
+                    jpgCount += 1
+                } else if ext == "png" {
+                    let dest = masksDir.appendingPathComponent(name)
+                    if !fm.fileExists(atPath: dest.path) {
+                        try? fm.copyItem(at: url, to: dest)
+                    }
+                    pngCount += 1
+                }
+            }
+        }
+        print("Plan B: copied \(jpgCount) jpg + \(pngCount) png → \(target.path)")
+
+        guard jpgCount > 0 else {
+            print("Plan B: no jpg files found in app bundle — dataset images weren't bundled.")
+            return nil
+        }
+
+        preparedDatasetPath = target.path
+        return target.path
     }
 
     var body: some View {
