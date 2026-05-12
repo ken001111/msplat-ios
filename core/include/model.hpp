@@ -39,6 +39,11 @@ struct Model{
   void saveSplat(const std::string &filename);
   int loadPly(const std::string &filename);
   void saveCheckpoint(const std::string &filename, int step);
+  // Phase 2c.0: unproject rendered depth from all given cameras into a world-
+  // space point cloud, write as PLY. Each pixel with alpha > alphaThresh
+  // becomes one (x, y, z, r, g, b) tuple. Returns number of points written.
+  int64_t exportPointCloud(std::vector<Camera> &cameras, int step,
+                            float alphaThresh, const std::string &outPath);
   int loadCheckpoint(const std::string &filename);
   struct CamSetup {
     float fx, fy, cx, cy;

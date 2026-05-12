@@ -107,6 +107,16 @@ int main(int argc, char *argv[]) {
     app.add_option("--dump-init-scales", dumpInitScales,
         "Dump initial scales tensor to <path> and exit (Phase 2b.2a validation)");
 
+    // Phase 2c.0: unproject rendered depth across all training cameras into
+    // a world-space point cloud and save as PLY. Requires a loaded scene
+    // (either freshly trained or via --resume).
+    std::string exportPointCloud;
+    app.add_option("--export-point-cloud", exportPointCloud,
+        "Unproject depth from all training views, save world-space point cloud PLY at <path>");
+    float pointCloudAlphaThresh = 0.5f;
+    app.add_option("--point-cloud-alpha-thresh", pointCloudAlphaThresh,
+        "Min accumulated alpha for a pixel to contribute a point (default 0.5)");
+
     // Phase 2b.3.2 (6/N) smoke hook: load a PLY (3DGS or 2DGS) and render the
     // first training camera with msplat_render, then exit. Reports min/max/mean
     // and nonzero counts on out_img + the 2DGS side outputs (out_depth /
@@ -237,6 +247,17 @@ int main(int argc, char *argv[]) {
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene, numIters);
+
+        // Phase 2c.0: depth → point cloud export
+        if (!exportPointCloud.empty()) {
+            auto pc_t0 = std::chrono::high_resolution_clock::now();
+            int64_t n = model.exportPointCloud(cams, (int)numIters,
+                                               pointCloudAlphaThresh, exportPointCloud);
+            auto pc_t1 = std::chrono::high_resolution_clock::now();
+            double pc_s = std::chrono::duration_cast<std::chrono::milliseconds>(pc_t1 - pc_t0).count() / 1000.0;
+            std::cout << "Exported " << n << " points to " << exportPointCloud
+                      << " in " << pc_s << "s" << std::endl;
+        }
 
         // Evaluation
         if (evalMode && !testCams.empty()) {

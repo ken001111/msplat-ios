@@ -543,6 +543,91 @@ MTensor Model::render(Camera& cam, int step){
         opacities, backgroundColor);
 }
 
+// Phase 2c.0: unproject rendered depth maps from all training views into a
+// world-space point cloud, save as PLY. Each pixel with accumulated alpha
+// > alphaThresh produces one point at world position derived from
+// (px, py, depth/alpha) and the camera's camToWorld extrinsic.
+//
+// The view-matrix construction in prepareCam negates columns 1 and 2 of
+// camToWorld — that's the OpenGL→CV axis convention flip. To get back to
+// world space from CV camera coords (Z forward, positive depth = visible),
+// we use the SAME flipped rotation rather than raw camToWorld.
+int64_t Model::exportPointCloud(std::vector<Camera> &cameras, int step,
+                                  float alphaThresh, const std::string &outPath) {
+    std::vector<float> xyz;
+    std::vector<uint8_t> rgb;
+    xyz.reserve(cameras.size() * 1024 * 6);   // very rough upfront alloc
+    rgb.reserve(cameras.size() * 1024 * 3);
+
+    for (auto &cam : cameras) {
+        if (!cam.cachedViewMat.defined()) cam.loadImage(getDownscaleFactor(step));
+        MTensor out_img = render(cam, step);
+        msplat_gpu_sync();
+        MTensor img_cpu   = out_img.cpu();
+        MTensor depth_cpu = msplat_last_out_depth().cpu();
+        MTensor alpha_cpu = msplat_last_out_alpha().cpu();
+        const int H = (int)img_cpu.size(0), W = (int)img_cpu.size(1);
+
+        // Intrinsics at the downscaled resolution prepareCam used.
+        const float sf = getDownscaleFactor(step);
+        const float fx = cam.fx / sf, fy = cam.fy / sf;
+        const float cx = cam.cx / sf, cy = cam.cy / sf;
+
+        // OpenGL→CV flip: negate cols 1, 2 of the rotation block of camToWorld.
+        // Translation stays as-is.
+        const float *c2w = cam.camToWorld;
+        const float r00 = c2w[0],  r01 = -c2w[1], r02 = -c2w[2];
+        const float r10 = c2w[4],  r11 = -c2w[5], r12 = -c2w[6];
+        const float r20 = c2w[8],  r21 = -c2w[9], r22 = -c2w[10];
+        const float t0 = c2w[3], t1 = c2w[7], t2 = c2w[11];
+
+        const float *img_p   = img_cpu.data<float>();
+        const float *depth_p = depth_cpu.data<float>();
+        const float *alpha_p = alpha_cpu.data<float>();
+
+        for (int py = 0; py < H; py++) {
+            for (int px = 0; px < W; px++) {
+                int idx = py * W + px;
+                float a = alpha_p[idx];
+                if (a < alphaThresh) continue;
+                float d = depth_p[idx] / a;   // alpha-divided to get mean depth
+                if (!std::isfinite(d) || d <= 0.0f) continue;
+
+                // Camera-space (CV convention): pinhole back-projection.
+                float xc = (px + 0.5f - cx) * d / fx;
+                float yc = (py + 0.5f - cy) * d / fy;
+                float zc = d;
+
+                // CV camera-to-world.
+                float xw = r00*xc + r01*yc + r02*zc + t0;
+                float yw = r10*xc + r11*yc + r12*zc + t1;
+                float zw = r20*xc + r21*yc + r22*zc + t2;
+
+                xyz.push_back(xw); xyz.push_back(yw); xyz.push_back(zw);
+                rgb.push_back((uint8_t)std::clamp(img_p[3*idx]   * 255.0f, 0.0f, 255.0f));
+                rgb.push_back((uint8_t)std::clamp(img_p[3*idx+1] * 255.0f, 0.0f, 255.0f));
+                rgb.push_back((uint8_t)std::clamp(img_p[3*idx+2] * 255.0f, 0.0f, 255.0f));
+            }
+        }
+    }
+
+    int64_t N = (int64_t)(xyz.size() / 3);
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out.is_open()) throw std::runtime_error("Cannot open " + outPath);
+    out << "ply\nformat binary_little_endian 1.0\n";
+    out << "comment msplat 2c.0 point cloud (unprojected depth, "
+        << cameras.size() << " views)\n";
+    out << "element vertex " << N << "\n";
+    out << "property float x\nproperty float y\nproperty float z\n";
+    out << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    out << "end_header\n";
+    for (int64_t i = 0; i < N; i++) {
+        out.write(reinterpret_cast<const char*>(&xyz[i*3]), 12);
+        out.write(reinterpret_cast<const char*>(&rgb[i*3]), 3);
+    }
+    return N;
+}
+
 // M2.6: 2DGS training step. Calls msplat_train_step_2dgs to compute the
 // forward + loss + per-gaussian gradients, then runs fused_adam on each
 // of the 6 parameter groups. Returns the scalar loss for caller reporting.
