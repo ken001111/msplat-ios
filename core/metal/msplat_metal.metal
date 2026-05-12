@@ -2039,6 +2039,67 @@ kernel void project_and_sh_backward_2dgs_kernel(
     dL_dmean2D[2*idx+0] = dL_dtransMat[base + 6] * depth_fwd * 0.5f * W;
     dL_dmean2D[2*idx+1] = dL_dtransMat[base + 7] * depth_fwd * 0.5f * H;
 }
+
+// ===== 2DGS training losses (M2.4) =====
+// Minimal first-pass: L1 image loss + depth-distortion regularizer. SSIM and
+// normal-consistency are deferred — they add ~150 lines each and aren't
+// strictly required to verify the backward chain end-to-end (M2.7 smoke
+// just needs loss-down-over-iters from any well-conditioned loss).
+//
+// Produces upstream gradients for rasterize_backward_2dgs:
+//   dL_dout_img       = sign(rendered - gt) / N        (per pixel × 3 channels)
+//   dL_dout_distortion = lambda_dist / N               (uniform per pixel)
+//   dL_dout_depth, dL_dout_alpha, dL_dout_normal,
+//   dL_dout_median_depth                              = 0 (host blit zeroes them)
+//
+// Also computes the per-pixel loss contribution and atomically accumulates
+// it into a scalar loss_sum for host-side reporting.
+
+kernel void loss_l1_distortion_2dgs_kernel(
+    constant uint2& img_size,
+    constant float& inv_num_pixels,        // 1 / (H * W * 3) for L1 normalization
+    constant float& lambda_l1,             // typically 0.8 (1 - ssim_weight)
+    constant float& lambda_dist,           // depth distortion regularizer weight
+    // Forward outputs (read).
+    constant float* out_img,               // float3 per pixel — already +bg composited
+    constant float* gt,                    // float3 per pixel
+    constant float* out_distortion,        // float per pixel — needed for the regularizer loss value
+    // Gradient outputs (write — host blits to zero before this dispatch).
+    device float* dL_dout_img,             // float3 per pixel
+    device float* dL_dout_distortion,      // float per pixel
+    // Scalar loss reduction.
+    device atomic<float>* loss_sum,
+    uint2 pix [[thread_position_in_grid]]
+) {
+    uint W = img_size.x;
+    uint H = img_size.y;
+    if (pix.x >= W || pix.y >= H) return;
+    uint pix_id = pix.y * W + pix.x;
+
+    float local_loss = 0.0f;
+
+    // L1 image loss per channel.
+    for (int ch = 0; ch < 3; ch++) {
+        float r = out_img[3 * pix_id + ch];
+        float g = gt[3 * pix_id + ch];
+        float diff = r - g;
+        local_loss += lambda_l1 * fabs(diff) * inv_num_pixels;
+        // dL/d(rendered) = lambda * sign(diff) * inv_N. sign(0) = 0 to avoid NaN.
+        float sign_diff = (diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f);
+        dL_dout_img[3 * pix_id + ch] = lambda_l1 * sign_diff * inv_num_pixels;
+    }
+
+    // Depth distortion regularizer — uniform per-pixel grad, sum the loss
+    // value too (distortion is already accumulated per-pixel in the forward).
+    float dist = out_distortion[pix_id];
+    // Per-pixel normalization: mean over H*W. inv_num_pixels is 1/(H*W*3) so
+    // multiply by 3 to get the per-pixel mean (avoiding another scalar).
+    float inv_HW = inv_num_pixels * 3.0f;
+    local_loss += lambda_dist * dist * inv_HW;
+    dL_dout_distortion[pix_id] = lambda_dist * inv_HW;
+
+    atomic_fetch_add_explicit(loss_sum, local_loss, memory_order_relaxed);
+}
 // Single-dispatch inclusive prefix sum (cumsum) for int32 arrays.
 // Uses one threadgroup: each thread serially sums its chunk, thread 0 scans
 // block totals, then all threads write inclusive prefix sums.

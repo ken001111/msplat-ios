@@ -135,6 +135,8 @@ struct MetalContext {
     // 2DGS backward pipeline (M2.2 / M2.3 — dead code until dispatch lands in M2.5)
     id<MTLComputePipelineState> nd_rasterize_backward_2dgs_kernel_cpso;
     id<MTLComputePipelineState> project_and_sh_backward_2dgs_kernel_cpso;
+    // 2DGS training losses (M2.4)
+    id<MTLComputePipelineState> loss_l1_distortion_2dgs_kernel_cpso;
     // Tile-local sorting (shared with densify)
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     // Prefix sum (shared with densify)
@@ -228,6 +230,8 @@ MetalContext* init_msplat_metal_context() {
     // 2DGS backward pipeline (M2.2 / M2.3 — dead code until dispatch lands in M2.5).
     ctx->nd_rasterize_backward_2dgs_kernel_cpso   = load(@"nd_rasterize_backward_2dgs_kernel");
     ctx->project_and_sh_backward_2dgs_kernel_cpso = load(@"project_and_sh_backward_2dgs_kernel");
+    // 2DGS training losses (M2.4).
+    ctx->loss_l1_distortion_2dgs_kernel_cpso      = load(@"loss_l1_distortion_2dgs_kernel");
     // Tile-local sorting + prefix sum (shared with densify)
     ctx->scatter_to_prealloc_bins_kernel_cpso     = load(@"scatter_to_prealloc_bins_kernel");
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
@@ -356,6 +360,17 @@ struct FusedTensorCache {
     MTensor dL_dfeatures_rest; // [N, frBases, 3] — allocated on first dispatch (frBases known)
     int     frBases_for_grad = 0;
 
+    // M2.4 loss-stage upstream gradients on the forward outputs. These feed
+    // into rasterize_backward_2dgs's `dL_dout_*` arguments. Image-size-keyed
+    // alloc (no per-gaussian dim).
+    MTensor dL_dout_img;          // [H, W, 3]
+    MTensor dL_dout_depth;        // [H, W]
+    MTensor dL_dout_alpha;        // [H, W]
+    MTensor dL_dout_normal;       // [H, W, 3]
+    MTensor dL_dout_median_depth; // [H, W]
+    MTensor dL_dout_distortion;   // [H, W]
+    MTensor loss_sum;             // [1] scalar reduction
+
     // Tile-local sorting buffers (shared with densify)
     MTensor tile_bins;
     MTensor tile_offsets, tile_scatter_counters;
@@ -415,6 +430,13 @@ struct FusedTensorCache {
             out_alpha = mtensor_empty(dev, {ih, iw}, DType::Float32);
             out_median_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
             out_distortion = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            // M2.4 loss-stage upstream gradients (zeroed each train step by host blit).
+            dL_dout_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            dL_dout_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            dL_dout_alpha = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            dL_dout_normal = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            dL_dout_median_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            dL_dout_distortion = mtensor_empty(dev, {ih, iw}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
@@ -425,6 +447,9 @@ struct FusedTensorCache {
         }
         if (!overflow_flag.defined()) {
             overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
+        }
+        if (!loss_sum.defined()) {
+            loss_sum = mtensor_empty(dev, {1}, DType::Float32);
         }
     }
 
