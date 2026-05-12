@@ -4,12 +4,19 @@ import Foundation
 /// Trains a 3D Gaussian Splatting scene on a dataset.
 public class GaussianTrainer {
     private let handle: MsplatTrainer
+    // Retain the dataset so the C++ Trainer's internal `Dataset*` stays alive
+    // for the lifetime of the trainer — the C side holds it as a raw pointer.
+    // Without this, the dataset would be released as soon as it falls out of
+    // the caller's scope, and any post-training method (render, extractMesh,
+    // evaluate, ...) would hit a use-after-free.
+    private let dataset: GaussianDataset
 
     /// Create a trainer.
     /// - Parameters:
-    ///   - dataset: The loaded dataset. Must outlive the trainer.
+    ///   - dataset: The loaded dataset. Retained by the trainer.
     ///   - config: Training configuration.
     public init(dataset: GaussianDataset, config: TrainingConfig = TrainingConfig()) {
+        self.dataset = dataset
         handle = msplat_trainer_create(dataset.handle, config.toC())
     }
 
