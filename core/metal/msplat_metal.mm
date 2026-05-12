@@ -128,36 +128,19 @@ struct MetalContext {
                 (unsigned long)sampleCount);
     }
 
-    // Forward pipeline kernels
-    id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
-    id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
-    // Phase 2b.3.1 — 2DGS forward variants (loaded but not yet dispatched).
+    // 2DGS forward pipeline (the only render path)
     id<MTLComputePipelineState> project_and_sh_forward_2dgs_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_2dgs_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_2dgs_kernel_cpso;
-    // Tile-local sorting
+    // Tile-local sorting (shared with densify)
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
-    id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
-    // Prefix sum
+    // Prefix sum (shared with densify)
     id<MTLComputePipelineState> prefix_sum_kernel_cpso;
     id<MTLComputePipelineState> block_reduce_kernel_cpso;
     id<MTLComputePipelineState> block_scan_propagate_kernel_cpso;
-    // Depth-chunked rasterization
-    id<MTLComputePipelineState> rasterize_forward_chunked_kernel_cpso;
-    id<MTLComputePipelineState> rasterize_forward_merge_kernel_cpso;
-    id<MTLComputePipelineState> compute_chunk_prefix_suffix_kernel_cpso;
-    id<MTLComputePipelineState> rasterize_backward_chunked_kernel_cpso;
-    id<MTLComputePipelineState> rasterize_backward_kernel_cpso;
-    // Separable SSIM loss kernels
-    id<MTLComputePipelineState> ssim_h_fwd_kernel_cpso;
-    id<MTLComputePipelineState> ssim_v_fwd_kernel_cpso;
-    id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso;
-    id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso;
-    // Backward pipeline kernels
-    id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso;
+    // Adam optimizer (M2 reuses)
     id<MTLComputePipelineState> fused_adam_kernel_cpso;
-    id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso;
-    // GPU densification kernels
+    // GPU densification kernels (kScaleDim-parametric, M2 reuses)
     id<MTLComputePipelineState> densify_classify_kernel_cpso;
     id<MTLComputePipelineState> densify_append_split_kernel_cpso;
     id<MTLComputePipelineState> densify_append_dup_kernel_cpso;
@@ -235,39 +218,18 @@ MetalContext* init_msplat_metal_context() {
         return pso;
     };
 
-    // Forward pipeline
-    ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
-    ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
-    // Phase 2b.3.1: 2DGS forward variants. Loaded eagerly so any kernel-creation
-    // error (signature mismatch, threadgroup-memory overflow, etc.) surfaces at
-    // startup rather than first 2DGS dispatch. Not used until the dispatcher
-    // wires them up in a later commit.
+    // 2DGS forward pipeline
     ctx->project_and_sh_forward_2dgs_kernel_cpso  = load(@"project_and_sh_forward_2dgs_kernel");
     ctx->nd_rasterize_forward_2dgs_kernel_cpso    = load(@"nd_rasterize_forward_2dgs_kernel");
     ctx->bitonic_sort_per_tile_2dgs_kernel_cpso   = load(@"bitonic_sort_per_tile_2dgs_kernel");
-    // Tile-local sorting
-    ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
-    ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
-    // Prefix sum
+    // Tile-local sorting + prefix sum (shared with densify)
+    ctx->scatter_to_prealloc_bins_kernel_cpso     = load(@"scatter_to_prealloc_bins_kernel");
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
     ctx->block_reduce_kernel_cpso                 = load(@"block_reduce_kernel");
     ctx->block_scan_propagate_kernel_cpso         = load(@"block_scan_propagate_kernel");
-    // Depth-chunked rasterization
-    ctx->rasterize_forward_chunked_kernel_cpso    = load(@"rasterize_forward_chunked_kernel");
-    ctx->rasterize_forward_merge_kernel_cpso      = load(@"rasterize_forward_merge_kernel");
-    ctx->compute_chunk_prefix_suffix_kernel_cpso  = load(@"compute_chunk_prefix_suffix_kernel");
-    ctx->rasterize_backward_chunked_kernel_cpso   = load(@"rasterize_backward_chunked_kernel");
-    ctx->rasterize_backward_kernel_cpso           = load(@"rasterize_backward_kernel");
-    // Separable SSIM loss
-    ctx->ssim_h_fwd_kernel_cpso                   = load(@"ssim_h_fwd_kernel");
-    ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
-    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load(@"ssim_fused_v_fwd_h_bwd_kernel");
-    ctx->ssim_v_bwd_kernel_cpso                   = load(@"ssim_v_bwd_kernel");
-    // Backward pipeline
-    ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
-    ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");
-    ctx->accumulate_grad_stats_kernel_cpso        = load(@"accumulate_grad_stats_kernel");
-    // GPU densification
+    // Adam (M2 reuses)
+    ctx->fused_adam_kernel_cpso                   = load(@"fused_adam_kernel");
+    // GPU densification (kScaleDim-parametric, M2 reuses)
     ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
     ctx->densify_append_split_kernel_cpso         = load(@"densify_append_split_kernel");
     ctx->densify_append_dup_kernel_cpso           = load(@"densify_append_dup_kernel");
