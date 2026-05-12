@@ -703,6 +703,268 @@ MTensor msplat_last_out_alpha()        { return g_tcache.out_alpha; }
 MTensor msplat_last_out_median_depth() { return g_tcache.out_median_depth; }
 MTensor msplat_last_out_distortion()   { return g_tcache.out_distortion; }
 
+// M2.3/M2.4 per-gaussian gradient accessors.
+MTensor msplat_last_dL_dmean3D()        { return g_tcache.dL_dmean3D; }
+MTensor msplat_last_dL_dscale()         { return g_tcache.dL_dscale; }
+MTensor msplat_last_dL_dquat()          { return g_tcache.dL_dquat; }
+MTensor msplat_last_dL_dopacity()       { return g_tcache.dL_dopacity; }
+MTensor msplat_last_dL_dfeatures_dc()   { return g_tcache.dL_dfeatures_dc; }
+MTensor msplat_last_dL_dfeatures_rest() { return g_tcache.dL_dfeatures_rest; }
+MTensor msplat_last_dL_dmean2D()        { return g_tcache.dL_dmean2D; }
+MTensor msplat_last_radii()             { return g_tcache.radii_out; }
+
+// ============================================================================
+// M2.5: 2DGS training step (forward + loss + backward, no Adam).
+// Single command buffer encodes: zero accumulators → project_2dgs →
+// prefix_map_2dgs → rasterize_fwd_2dgs → loss → rasterize_bwd_2dgs →
+// project_bwd_2dgs. Adam parameter update is M2.6 (host-side, separate CB).
+// ============================================================================
+std::tuple<MTensor, float> msplat_train_step_2dgs(
+    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
+    MTensor &quats, MTensor &viewmat, MTensor &projmat,
+    float fx, float fy, float cx, float cy,
+    unsigned img_height, unsigned img_width,
+    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
+    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
+    MTensor &features_dc, MTensor &features_rest,
+    MTensor &opacities, MTensor &background,
+    MTensor &gt, int features_rest_bases,
+    float lambda_l1, float lambda_dist
+) {
+    MetalContext* ctx = get_global_context();
+    int tile_bounds_x = std::get<0>(tile_bounds);
+    int tile_bounds_y = std::get<1>(tile_bounds);
+    int num_tiles = tile_bounds_x * tile_bounds_y;
+    int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
+    uint32_t channels = 3;
+
+    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_features_rest_grad(features_rest_bases, ctx->device);
+
+    MTensor &xys = g_tcache.xys;
+    MTensor &depths = g_tcache.depths;
+    MTensor &radii_out = g_tcache.radii_out;
+    MTensor &num_tiles_hit = g_tcache.num_tiles_hit;
+    MTensor &colors = g_tcache.colors;
+    MTensor &aabb = g_tcache.aabb;
+    MTensor &gaussian_ids = g_tcache.gaussian_ids;
+    MTensor &tile_bins = g_tcache.tile_bins;
+    MTensor &packed_rgb = g_tcache.packed_rgb;
+    MTensor &out_img = g_tcache.out_img;
+    MTensor &final_Ts = g_tcache.final_Ts;
+    MTensor &final_idx = g_tcache.final_idx;
+
+    auto proj_intrins = std::make_shared<std::array<float, 4>>(std::array<float, 4>{fx, fy, cx, cy});
+    auto proj_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
+    auto tile_bounds_arr = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
+        (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y, (uint32_t)std::get<2>(tile_bounds), 0xDEAD});
+    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    uint32_t num_points_u32 = (uint32_t)num_points;
+    auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
+    auto img_size_dim2 = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
+    auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
+
+    float inv_num_pixels = 1.0f / (float)(img_height * img_width * 3);
+
+    auto encode_proj_sh_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->project_and_sh_forward_2dgs_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->project_and_sh_forward_2dgs_kernel_cpso];
+        ENC_SCALAR(enc, num_points_u32, 0);
+        ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
+        ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
+        ENC_BUF(enc, viewmat, 5); ENC_BUF(enc, projmat, 6);
+        [enc setBytes:proj_intrins->data() length:sizeof(*proj_intrins) atIndex:7];
+        [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:8];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:9];
+        ENC_SCALAR(enc, clip_thresh, 10);
+        ENC_BUF(enc, xys, 11); ENC_BUF(enc, depths, 12); ENC_BUF(enc, radii_out, 13);
+        ENC_BUF(enc, g_tcache.transMats, 14);
+        ENC_BUF(enc, num_tiles_hit, 15);
+        ENC_BUF(enc, g_tcache.normal_opacity, 16);
+        ENC_BUF(enc, opacities, 17);
+        ENC_SCALAR(enc, degree, 18); ENC_SCALAR(enc, degrees_to_use, 19);
+        [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:20];
+        ENC_BUF(enc, features_dc, 21); ENC_BUF(enc, features_rest, 22);
+        ENC_BUF(enc, colors, 23); ENC_BUF(enc, aabb, 24);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    auto encode_prefix_map_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        uint32_t num_tiles_u32 = (uint32_t)num_tiles;
+        {
+            NSUInteger tpg = MIN(ctx->scatter_to_prealloc_bins_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->scatter_to_prealloc_bins_kernel_cpso];
+            ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, depths, 2);
+            ENC_BUF(enc, radii_out, 3); ENC_BUF(enc, aabb, 4);
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
+            ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 7);
+            ENC_BUF(enc, g_tcache.overflow_flag, 8);
+            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        {
+            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
+            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
+            ENC_SCALAR(enc, num_tiles_u32, 0);
+            ENC_BUF(enc, g_tcache.tile_scatter_counters, 1);
+            ENC_BUF(enc, g_tcache.tile_offsets, 2);
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        {
+            [enc setComputePipelineState:ctx->bitonic_sort_per_tile_2dgs_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_offsets, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 2);
+            ENC_BUF(enc, gaussian_ids, 3);
+            ENC_SCALAR(enc, num_tiles_u32, 4);
+            ENC_BUF(enc, xys, 5);
+            ENC_BUF(enc, g_tcache.transMats, 6);
+            ENC_BUF(enc, g_tcache.normal_opacity, 7);
+            ENC_BUF(enc, colors, 8);
+            ENC_BUF(enc, g_tcache.packed_xy, 9);
+            ENC_BUF(enc, g_tcache.packed_transmat, 10);
+            ENC_BUF(enc, g_tcache.packed_normal_opac, 11);
+            ENC_BUF(enc, packed_rgb, 12);
+            ENC_BUF(enc, tile_bins, 13);
+            [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+    };
+
+    auto encode_rast_fwd_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->nd_rasterize_forward_2dgs_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
+        ENC_BUF(enc, g_tcache.packed_xy, 4); ENC_BUF(enc, g_tcache.packed_normal_opac, 5);
+        ENC_BUF(enc, g_tcache.packed_transmat, 6); ENC_BUF(enc, packed_rgb, 7);
+        ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, out_img, 10);
+        ENC_BUF(enc, g_tcache.out_depth, 11); ENC_BUF(enc, g_tcache.out_normal, 12);
+        ENC_BUF(enc, g_tcache.out_alpha, 13); ENC_BUF(enc, g_tcache.out_median_depth, 14);
+        ENC_BUF(enc, g_tcache.out_distortion, 15);
+        ENC_BUF(enc, background, 16);
+        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:17];
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
+    };
+
+    auto encode_loss = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:ctx->loss_l1_distortion_2dgs_kernel_cpso];
+        [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+        ENC_SCALAR(enc, inv_num_pixels, 1);
+        ENC_SCALAR(enc, lambda_l1, 2); ENC_SCALAR(enc, lambda_dist, 3);
+        ENC_BUF(enc, out_img, 4); ENC_BUF(enc, gt, 5);
+        ENC_BUF(enc, g_tcache.out_distortion, 6);
+        ENC_BUF(enc, g_tcache.dL_dout_img, 7);
+        ENC_BUF(enc, g_tcache.dL_dout_distortion, 8);
+        ENC_BUF(enc, g_tcache.loss_sum, 9);
+        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    };
+
+    auto encode_rast_bwd_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->nd_rasterize_backward_2dgs_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_BUF(enc, tile_bins, 2);
+        ENC_BUF(enc, gaussian_ids, 3);
+        ENC_BUF(enc, g_tcache.packed_xy, 4); ENC_BUF(enc, g_tcache.packed_normal_opac, 5);
+        ENC_BUF(enc, g_tcache.packed_transmat, 6); ENC_BUF(enc, packed_rgb, 7);
+        ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9);
+        ENC_BUF(enc, background, 10);
+        ENC_BUF(enc, g_tcache.dL_dout_img, 11);
+        ENC_BUF(enc, g_tcache.dL_dout_depth, 12);
+        ENC_BUF(enc, g_tcache.dL_dout_alpha, 13);
+        ENC_BUF(enc, g_tcache.dL_dout_normal, 14);
+        ENC_BUF(enc, g_tcache.dL_dout_median_depth, 15);
+        ENC_BUF(enc, g_tcache.dL_dout_distortion, 16);
+        ENC_BUF(enc, g_tcache.dL_dtransMat, 17);
+        ENC_BUF(enc, g_tcache.dL_dmean2D, 18);
+        ENC_BUF(enc, g_tcache.dL_dnormal3D, 19);
+        ENC_BUF(enc, g_tcache.dL_dopacity, 20);
+        ENC_BUF(enc, g_tcache.dL_dcolors, 21);
+        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:22];
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
+    };
+
+    auto encode_proj_bwd_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->project_and_sh_backward_2dgs_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->project_and_sh_backward_2dgs_kernel_cpso];
+        ENC_SCALAR(enc, num_points_u32, 0);
+        ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
+        ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
+        ENC_BUF(enc, viewmat, 5); ENC_BUF(enc, projmat, 6);
+        [enc setBytes:proj_intrins->data() length:sizeof(*proj_intrins) atIndex:7];
+        [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:8];
+        ENC_BUF(enc, radii_out, 9);
+        ENC_BUF(enc, g_tcache.dL_dtransMat, 10);
+        ENC_BUF(enc, g_tcache.dL_dnormal3D, 11);
+        ENC_BUF(enc, g_tcache.dL_dcolors, 12);
+        ENC_SCALAR(enc, degree, 13); ENC_SCALAR(enc, degrees_to_use, 14);
+        [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:15];
+        ENC_BUF(enc, g_tcache.dL_dmean3D, 16);
+        ENC_BUF(enc, g_tcache.dL_dscale, 17);
+        ENC_BUF(enc, g_tcache.dL_dquat, 18);
+        ENC_BUF(enc, g_tcache.dL_dmean2D, 19);
+        ENC_BUF(enc, g_tcache.dL_dfeatures_dc, 20);
+        ENC_BUF(enc, g_tcache.dL_dfeatures_rest, 21);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    {
+        id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+        assert(command_buffer && "Failed to retrieve command buffer reference");
+
+        dispatch_sync(ctx->d_queue, ^(){
+            // Zero accumulators that get atomic-summed during this step.
+            id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.loss_sum.buffer() range:NSMakeRange(0, g_tcache.loss_sum.nbytes()) value:0];
+            // Per-gaussian gradient accumulators — zero before atomic scatter.
+            [blit fillBuffer:g_tcache.dL_dtransMat.buffer() range:NSMakeRange(0, g_tcache.dL_dtransMat.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.dL_dmean2D.buffer()   range:NSMakeRange(0, g_tcache.dL_dmean2D.nbytes())   value:0];
+            [blit fillBuffer:g_tcache.dL_dnormal3D.buffer() range:NSMakeRange(0, g_tcache.dL_dnormal3D.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.dL_dopacity.buffer()  range:NSMakeRange(0, g_tcache.dL_dopacity.nbytes())  value:0];
+            [blit fillBuffer:g_tcache.dL_dcolors.buffer()   range:NSMakeRange(0, g_tcache.dL_dcolors.nbytes())   value:0];
+            // Loss-stage gradient outputs — host zeroes the un-written channels
+            // (depth/alpha/normal/median_depth) so the bwd rasterizer reads 0
+            // for the unused upstream gradients.
+            [blit fillBuffer:g_tcache.dL_dout_img.buffer()         range:NSMakeRange(0, g_tcache.dL_dout_img.nbytes())         value:0];
+            [blit fillBuffer:g_tcache.dL_dout_depth.buffer()       range:NSMakeRange(0, g_tcache.dL_dout_depth.nbytes())       value:0];
+            [blit fillBuffer:g_tcache.dL_dout_alpha.buffer()       range:NSMakeRange(0, g_tcache.dL_dout_alpha.nbytes())       value:0];
+            [blit fillBuffer:g_tcache.dL_dout_normal.buffer()      range:NSMakeRange(0, g_tcache.dL_dout_normal.nbytes())      value:0];
+            [blit fillBuffer:g_tcache.dL_dout_median_depth.buffer() range:NSMakeRange(0, g_tcache.dL_dout_median_depth.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.dL_dout_distortion.buffer()  range:NSMakeRange(0, g_tcache.dL_dout_distortion.nbytes())  value:0];
+            // dL_dfeatures_rest is written = per-thread (no atomic); fill anyway
+            // so culled gaussians get clean zeros without an explicit branch.
+            [blit fillBuffer:g_tcache.dL_dfeatures_rest.buffer() range:NSMakeRange(0, g_tcache.dL_dfeatures_rest.nbytes()) value:0];
+            [blit endEncoding];
+
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            encode_proj_sh_2dgs(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_prefix_map_2dgs(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_rast_fwd_2dgs(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_loss(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_rast_bwd_2dgs(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_proj_bwd_2dgs(encoder);
+            [encoder endEncoding];
+        });
+    }
+
+    // Read loss back to host (CPU sync). Single scalar — cheap.
+    ctx->syncCB();
+    float loss_val = *g_tcache.loss_sum.data<float>();
+    return std::make_tuple(radii_out, loss_val);
+}
+
 
 // ============================================================================
 // GPU-native densification (v34 Phase 3)
