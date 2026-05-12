@@ -132,8 +132,9 @@ struct MetalContext {
     id<MTLComputePipelineState> project_and_sh_forward_2dgs_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_2dgs_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_2dgs_kernel_cpso;
-    // 2DGS backward pipeline (M2.2 — dead code until dispatch lands in M2.5)
+    // 2DGS backward pipeline (M2.2 / M2.3 — dead code until dispatch lands in M2.5)
     id<MTLComputePipelineState> nd_rasterize_backward_2dgs_kernel_cpso;
+    id<MTLComputePipelineState> project_and_sh_backward_2dgs_kernel_cpso;
     // Tile-local sorting (shared with densify)
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     // Prefix sum (shared with densify)
@@ -224,8 +225,9 @@ MetalContext* init_msplat_metal_context() {
     ctx->project_and_sh_forward_2dgs_kernel_cpso  = load(@"project_and_sh_forward_2dgs_kernel");
     ctx->nd_rasterize_forward_2dgs_kernel_cpso    = load(@"nd_rasterize_forward_2dgs_kernel");
     ctx->bitonic_sort_per_tile_2dgs_kernel_cpso   = load(@"bitonic_sort_per_tile_2dgs_kernel");
-    // 2DGS backward pipeline (M2.2 — dead code until dispatch lands in M2.5).
+    // 2DGS backward pipeline (M2.2 / M2.3 — dead code until dispatch lands in M2.5).
     ctx->nd_rasterize_backward_2dgs_kernel_cpso   = load(@"nd_rasterize_backward_2dgs_kernel");
+    ctx->project_and_sh_backward_2dgs_kernel_cpso = load(@"project_and_sh_backward_2dgs_kernel");
     // Tile-local sorting + prefix sum (shared with densify)
     ctx->scatter_to_prealloc_bins_kernel_cpso     = load(@"scatter_to_prealloc_bins_kernel");
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
@@ -345,6 +347,15 @@ struct FusedTensorCache {
     MTensor dL_dopacity;    // [N, 1]  per-gaussian
     MTensor dL_dcolors;     // [N, 3]  per-gaussian (gradient on raw SH-output color)
 
+    // M2.3 backward projection outputs — final per-gaussian gradients consumed
+    // by fused_adam in the eventual train_step (M2.5).
+    MTensor dL_dmean3D;        // [N, 3]
+    MTensor dL_dscale;         // [N, 2]
+    MTensor dL_dquat;          // [N, 4]
+    MTensor dL_dfeatures_dc;   // [N, 3]
+    MTensor dL_dfeatures_rest; // [N, frBases, 3] — allocated on first dispatch (frBases known)
+    int     frBases_for_grad = 0;
+
     // Tile-local sorting buffers (shared with densify)
     MTensor tile_bins;
     MTensor tile_offsets, tile_scatter_counters;
@@ -376,6 +387,14 @@ struct FusedTensorCache {
             dL_dnormal3D = mtensor_empty(dev, {np, 3}, DType::Float32);
             dL_dopacity = mtensor_empty(dev, {np, 1}, DType::Float32);
             dL_dcolors = mtensor_empty(dev, {np, 3}, DType::Float32);
+            // M2.3 final per-gaussian gradients.
+            dL_dmean3D = mtensor_empty(dev, {np, 3}, DType::Float32);
+            dL_dscale = mtensor_empty(dev, {np, 2}, DType::Float32);
+            dL_dquat = mtensor_empty(dev, {np, 4}, DType::Float32);
+            dL_dfeatures_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
+            // dL_dfeatures_rest allocated lazily — depends on SH degree.
+            dL_dfeatures_rest = MTensor{};
+            frBases_for_grad = 0;
         }
         if (cap != capacity) {
             capacity = cap;
@@ -406,6 +425,16 @@ struct FusedTensorCache {
         }
         if (!overflow_flag.defined()) {
             overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
+        }
+    }
+
+    // Lazy allocation for the SH-rest gradient — sized by frBases (depends on
+    // current SH degree, which grows during training).
+    void ensure_features_rest_grad(int frBases, id<MTLDevice> dev) {
+        if (frBases != frBases_for_grad || !dL_dfeatures_rest.defined()) {
+            frBases_for_grad = frBases;
+            dL_dfeatures_rest = mtensor_empty(dev,
+                {(int64_t)fwd_num_points, (int64_t)frBases, 3}, DType::Float32);
         }
     }
 };

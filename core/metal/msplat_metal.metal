@@ -1843,7 +1843,202 @@ kernel void nd_rasterize_backward_2dgs_kernel(
     }
 }
 
-// ===== Prefix Sum Kernel =====
+// ===== 2DGS project + SH backward (M2.3) =====
+// One thread per gaussian. Reads the atomic-accumulated gradients
+// (dL_dtransMat, dL_dnormal3D, dL_dcolors) from rasterize_backward_2dgs, plus
+// the forward parameters (means3D, scales, quats, viewmat, projmat), and
+// produces the final per-gaussian gradients:
+//
+//   dL_dmean3D        [N, 3]
+//   dL_dscale         [N, 2]
+//   dL_dquat          [N, 4]
+//   dL_dfeatures_dc   [N, 3]
+//   dL_dfeatures_rest [N, frBases, 3]
+//   dL_dmean2D        [N, 2]   (OVERWRITTEN here with the NDC-space formula
+//                              that densify reads; the rasterizer's atomic
+//                              accumulation into mean2D is discarded.)
+//
+// Derivation: this kernel re-derives the chain rule for the row-major T
+// construction in compute_transmat_2dgs (lines 226-295). The reference's
+// backward.cu:compute_transmat_aabb assumes glm column-major storage, so
+// it can't be transliterated — instead this is a direct VJP through the
+// (R, scale, projmat, halfW/H, cx/cy) → T formula in our forward.
+//
+// Dead code until M2.5 wires dispatch.
+kernel void project_and_sh_backward_2dgs_kernel(
+    constant int& num_points,
+    constant float* means3D,            // float3 per gaussian
+    constant float* scales,             // float2 per gaussian (log-space)
+    constant float& glob_scale,
+    constant float* quats,              // float4 per gaussian
+    constant float* viewmat,            // 4x4 row-major
+    constant float* projmat,            // 4x4 row-major (world → clip)
+    constant float4& intrins,           // (fx, fy, cx, cy)
+    constant uint2& img_size,
+    constant int* radii,                // per-gaussian (forward output; 0 = culled)
+    // Upstream gradients
+    constant float* dL_dtransMat,       // [N, 9]
+    constant float* dL_dnormal3D,       // [N, 3]
+    constant float* dL_dcolors,         // [N, 3] (gradient on raw SH output, post mask)
+    // SH inputs
+    constant uint& degree,
+    constant uint& degrees_to_use,
+    constant float3& cam_pos,
+    // Outputs
+    device float* dL_dmean3D,           // [N, 3]
+    device float* dL_dscale,            // [N, 2]
+    device float* dL_dquat,             // [N, 4]
+    device float* dL_dmean2D,           // [N, 2]  (OVERWRITE for densify hack)
+    device float* dL_dfeatures_dc,      // [N, 3]
+    device float* dL_dfeatures_rest,    // [N, frBases, 3]
+    uint3 gp [[thread_position_in_grid]]
+) {
+    uint idx = gp.x;
+    if (idx >= (uint)num_points) return;
+
+    // Culled gaussians: zero their per-gaussian gradients and bail.
+    if (radii[idx] <= 0) {
+        for (int k = 0; k < 3; k++) dL_dmean3D[3*idx+k] = 0.0f;
+        for (int k = 0; k < 2; k++) dL_dscale[2*idx+k] = 0.0f;
+        for (int k = 0; k < 4; k++) dL_dquat[4*idx+k] = 0.0f;
+        for (int k = 0; k < 2; k++) dL_dmean2D[2*idx+k] = 0.0f;
+        for (int k = 0; k < 3; k++) dL_dfeatures_dc[3*idx+k] = 0.0f;
+        // dL_dfeatures_rest is zero-init'd by host blit before this dispatch.
+        return;
+    }
+
+    // === Recompute forward state ===
+    float3 p_orig = read_packed_float3(means3D, idx);
+    float2 s_log = read_packed_float2(scales, idx);
+    float2 scale_2d = exp(s_log);
+    float4 quat = read_packed_float4(quats, idx);
+    float3x3 R = quat_to_rotmat(quat);
+    float sx = scale_2d.x * glob_scale;
+    float sy = scale_2d.y * glob_scale;
+    float3 tu_world = R[0] * sx;
+    float3 tv_world = R[1] * sy;
+    float3 normal_world = R[2];
+
+    // tu_clip / tv_clip / p_clip from projmat (row-major).
+    float4 tu_clip = float4(
+        projmat[0]*tu_world.x + projmat[1]*tu_world.y + projmat[2]*tu_world.z,
+        projmat[4]*tu_world.x + projmat[5]*tu_world.y + projmat[6]*tu_world.z,
+        projmat[8]*tu_world.x + projmat[9]*tu_world.y + projmat[10]*tu_world.z,
+        projmat[12]*tu_world.x + projmat[13]*tu_world.y + projmat[14]*tu_world.z);
+    float4 tv_clip = float4(
+        projmat[0]*tv_world.x + projmat[1]*tv_world.y + projmat[2]*tv_world.z,
+        projmat[4]*tv_world.x + projmat[5]*tv_world.y + projmat[6]*tv_world.z,
+        projmat[8]*tv_world.x + projmat[9]*tv_world.y + projmat[10]*tv_world.z,
+        projmat[12]*tv_world.x + projmat[13]*tv_world.y + projmat[14]*tv_world.z);
+    float4 p_clip = float4(
+        projmat[0]*p_orig.x + projmat[1]*p_orig.y + projmat[2]*p_orig.z + projmat[3],
+        projmat[4]*p_orig.x + projmat[5]*p_orig.y + projmat[6]*p_orig.z + projmat[7],
+        projmat[8]*p_orig.x + projmat[9]*p_orig.y + projmat[10]*p_orig.z + projmat[11],
+        projmat[12]*p_orig.x + projmat[13]*p_orig.y + projmat[14]*p_orig.z + projmat[15]);
+    float W = (float)img_size.x;
+    float H = (float)img_size.y;
+    float halfW = 0.5f * W;
+    float halfH = 0.5f * H;
+    float bx = intrins.z - 0.5f;
+    float by = intrins.w - 0.5f;
+
+    // === Chain rule ===
+    // dL_d(T_row_r[c]) is at dL_dtransMat[9*idx + 3*r + c].
+    // T_row0 = (col_u.x, col_v.x, col_o.x),
+    // T_row1 = (col_u.y, col_v.y, col_o.y),
+    // T_row2 = (col_u.z, col_v.z, col_o.z).
+    // So dL_dcol_u = (dL_dT_row0[0], dL_dT_row1[0], dL_dT_row2[0])
+    //             = (dL_dT[0], dL_dT[3], dL_dT[6])  per-gaussian (without idx*9).
+    uint base = idx * 9;
+    float3 dL_dcol_u = float3(dL_dtransMat[base+0], dL_dtransMat[base+3], dL_dtransMat[base+6]);
+    float3 dL_dcol_v = float3(dL_dtransMat[base+1], dL_dtransMat[base+4], dL_dtransMat[base+7]);
+    float3 dL_dcol_o = float3(dL_dtransMat[base+2], dL_dtransMat[base+5], dL_dtransMat[base+8]);
+
+    // col_u = (halfW*tu_clip.x + bx*tu_clip.w,
+    //         halfH*tu_clip.y + by*tu_clip.w,
+    //         tu_clip.w)
+    // tu_clip.z does not appear in col_u; dL_dtu_clip.z = 0.
+    float4 dL_dtu_clip;
+    dL_dtu_clip.x = halfW * dL_dcol_u.x;
+    dL_dtu_clip.y = halfH * dL_dcol_u.y;
+    dL_dtu_clip.z = 0.0f;
+    dL_dtu_clip.w = bx * dL_dcol_u.x + by * dL_dcol_u.y + dL_dcol_u.z;
+    float4 dL_dtv_clip;
+    dL_dtv_clip.x = halfW * dL_dcol_v.x;
+    dL_dtv_clip.y = halfH * dL_dcol_v.y;
+    dL_dtv_clip.z = 0.0f;
+    dL_dtv_clip.w = bx * dL_dcol_v.x + by * dL_dcol_v.y + dL_dcol_v.z;
+    float4 dL_dp_clip;
+    dL_dp_clip.x = halfW * dL_dcol_o.x;
+    dL_dp_clip.y = halfH * dL_dcol_o.y;
+    dL_dp_clip.z = 0.0f;
+    dL_dp_clip.w = bx * dL_dcol_o.x + by * dL_dcol_o.y + dL_dcol_o.z;
+
+    // tu_clip[i] = sum_{j=0..2} projmat[4i+j] * tu_world[j]   (no w input).
+    // dL_dtu_world[j] = sum_i projmat[4i+j] * dL_dtu_clip[i].
+    float3 dL_dtu_world;
+    dL_dtu_world.x = projmat[0]*dL_dtu_clip.x + projmat[4]*dL_dtu_clip.y + projmat[8]*dL_dtu_clip.z + projmat[12]*dL_dtu_clip.w;
+    dL_dtu_world.y = projmat[1]*dL_dtu_clip.x + projmat[5]*dL_dtu_clip.y + projmat[9]*dL_dtu_clip.z + projmat[13]*dL_dtu_clip.w;
+    dL_dtu_world.z = projmat[2]*dL_dtu_clip.x + projmat[6]*dL_dtu_clip.y + projmat[10]*dL_dtu_clip.z + projmat[14]*dL_dtu_clip.w;
+    float3 dL_dtv_world;
+    dL_dtv_world.x = projmat[0]*dL_dtv_clip.x + projmat[4]*dL_dtv_clip.y + projmat[8]*dL_dtv_clip.z + projmat[12]*dL_dtv_clip.w;
+    dL_dtv_world.y = projmat[1]*dL_dtv_clip.x + projmat[5]*dL_dtv_clip.y + projmat[9]*dL_dtv_clip.z + projmat[13]*dL_dtv_clip.w;
+    dL_dtv_world.z = projmat[2]*dL_dtv_clip.x + projmat[6]*dL_dtv_clip.y + projmat[10]*dL_dtv_clip.z + projmat[14]*dL_dtv_clip.w;
+    float3 dL_dp_orig;
+    dL_dp_orig.x = projmat[0]*dL_dp_clip.x + projmat[4]*dL_dp_clip.y + projmat[8]*dL_dp_clip.z + projmat[12]*dL_dp_clip.w;
+    dL_dp_orig.y = projmat[1]*dL_dp_clip.x + projmat[5]*dL_dp_clip.y + projmat[9]*dL_dp_clip.z + projmat[13]*dL_dp_clip.w;
+    dL_dp_orig.z = projmat[2]*dL_dp_clip.x + projmat[6]*dL_dp_clip.y + projmat[10]*dL_dp_clip.z + projmat[14]*dL_dp_clip.w;
+
+    // tu_world = R[0] * sx  →  dL_dR[0] = dL_dtu_world * sx,
+    //                          dL_dsx   = dot(dL_dtu_world, R[0])
+    // sx = scale_2d.x * glob_scale; scale_2d.x = exp(s_log.x); dL_d(s_log.x) = dL_dsx * scale_2d.x * glob_scale.
+    float dL_dsx = dot(dL_dtu_world, R[0]);
+    float dL_dsy = dot(dL_dtv_world, R[1]);
+    float dL_dslog_x = dL_dsx * scale_2d.x * glob_scale;
+    float dL_dslog_y = dL_dsy * scale_2d.y * glob_scale;
+
+    // Gradient on R columns. R[2] (normal) gets dL_dnormal3D directly.
+    float3 dL_dR_col0 = dL_dtu_world * sx;
+    float3 dL_dR_col1 = dL_dtv_world * sy;
+    float3 dL_dR_col2 = read_packed_float3(dL_dnormal3D, idx);
+
+    // quat VJP: pack the 3 column gradients into a float3x3 and call the helper.
+    float3x3 dL_dR = float3x3(dL_dR_col0, dL_dR_col1, dL_dR_col2);
+    float4 dL_dquat_v = quat_to_rotmat_vjp(quat, dL_dR);
+
+    // Write per-gaussian outputs (no atomic — one thread owns one gaussian).
+    dL_dmean3D[3*idx+0] = dL_dp_orig.x;
+    dL_dmean3D[3*idx+1] = dL_dp_orig.y;
+    dL_dmean3D[3*idx+2] = dL_dp_orig.z;
+    dL_dscale[2*idx+0] = dL_dslog_x;
+    dL_dscale[2*idx+1] = dL_dslog_y;
+    dL_dquat[4*idx+0] = dL_dquat_v.x;
+    dL_dquat[4*idx+1] = dL_dquat_v.y;
+    dL_dquat[4*idx+2] = dL_dquat_v.z;
+    dL_dquat[4*idx+3] = dL_dquat_v.w;
+
+    // SH chain rule. viewdir = normalize(p_world - cam_pos). dL_dcolors is the
+    // gradient on raw SH eval (already masked by the +0.5/max clamp in the
+    // rasterize backward).
+    float3 viewdir = normalize(p_orig - cam_pos);
+    uint num_bases = num_sh_bases(degree);
+    uint dc_idx = 3 * idx;
+    uint rest_idx = idx * (num_bases - 1) * 3;
+    sh_coeffs_to_color_vjp(
+        degrees_to_use, viewdir,
+        &dL_dcolors[3 * idx],
+        &dL_dfeatures_dc[dc_idx],
+        &dL_dfeatures_rest[rest_idx]);
+
+    // Densify hack: overwrite dL_dmean2D with the NDC-space contribution from
+    // the depth row of T (T_row2). In our row-major layout T_row2[col] sits at
+    // transMat[idx*9 + 6 + col]; the reference's column-major glm indexing
+    // reads idx*9 + 2 / +5 / +8 instead. The "depth" multiplier is the
+    // forward T_row2[2] (= p_clip.w in our construction).
+    float depth_fwd = p_clip.w;
+    dL_dmean2D[2*idx+0] = dL_dtransMat[base + 6] * depth_fwd * 0.5f * W;
+    dL_dmean2D[2*idx+1] = dL_dtransMat[base + 7] * depth_fwd * 0.5f * H;
+}
 // Single-dispatch inclusive prefix sum (cumsum) for int32 arrays.
 // Uses one threadgroup: each thread serially sums its chunk, thread 0 scans
 // block totals, then all threads write inclusive prefix sums.
