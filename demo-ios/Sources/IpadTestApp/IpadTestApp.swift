@@ -349,9 +349,16 @@ struct ContentView: View {
 
             // Mesh result (after extraction)
             if let path = engine.meshPath, !engine.meshExtracting {
-                Text("Mesh: \(engine.meshTriangles) tris → \((path as NSString).lastPathComponent)")
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.green)
+                HStack(spacing: 12) {
+                    Text("Mesh: \(engine.meshTriangles) tris → \((path as NSString).lastPathComponent)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.green)
+                    Spacer()
+                    ShareLink(item: URL(fileURLWithPath: path)) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                            .font(.caption)
+                    }
+                }
             }
 
             if datasetPath == nil {
