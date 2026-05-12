@@ -3,7 +3,10 @@ import PackageDescription
 
 let package = Package(
     name: "Msplat",
-    platforms: [.macOS(.v15)],
+    platforms: [
+        .macOS(.v15),
+        .iOS(.v17),       // iPhone 14 Pro and iPad Pro 6th gen (M2) — both on iOS 17+
+    ],
     products: [
         .library(name: "Msplat", targets: ["Msplat"]),
     ],
@@ -31,7 +34,7 @@ let package = Package(
             ]
         ),
 
-        // Tests
+        // Tests (macOS only — iOS test bundles need a host app)
         .testTarget(
             name: "MsplatTests",
             dependencies: ["Msplat"],

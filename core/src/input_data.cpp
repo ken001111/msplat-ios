@@ -195,23 +195,147 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs) const {
     f << arr.dump(2);
 }
 
+// ── LiDAR foreground mask application (Facescan / Colab parity) ─────────────
+
+namespace {
+
+// Read a grayscale image by sampling the R channel of an RGB load.
+// CoreGraphics expands single-channel PNGs to RGBA when decoding, so R == gray.
+std::vector<uint8_t> readMaskGray(const std::string &path, int &w, int &h) {
+    Image rgb = imreadRGB(path);
+    w = rgb.width; h = rgb.height;
+    std::vector<uint8_t> gray((size_t)w * h);
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        gray[i] = (uint8_t)(rgb.data[i * 3] * 255.0f + 0.5f);
+    }
+    return gray;
+}
+
+// Nearest-neighbor resize of an 8-bit single-channel image.
+std::vector<uint8_t> resizeMaskNN(const std::vector<uint8_t> &src,
+                                  int sw, int sh, int dw, int dh) {
+    std::vector<uint8_t> dst((size_t)dw * dh);
+    for (int y = 0; y < dh; y++) {
+        int sy = (int)((int64_t)y * sh / dh);
+        for (int x = 0; x < dw; x++) {
+            int sx = (int)((int64_t)x * sw / dw);
+            dst[(size_t)y * dw + x] = src[(size_t)sy * sw + sx];
+        }
+    }
+    return dst;
+}
+
+// Separable max-filter dilation, radius r (kernel size 2r+1). Matches the
+// behavior of PIL.ImageFilter.MaxFilter(2*r+1) used in Colab.
+std::vector<uint8_t> dilateMax(const std::vector<uint8_t> &src, int w, int h, int r) {
+    if (r <= 0) return src;
+    std::vector<uint8_t> tmp((size_t)w * h);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = &src[(size_t)y * w];
+        uint8_t *out = &tmp[(size_t)y * w];
+        for (int x = 0; x < w; x++) {
+            int x0 = std::max(0, x - r);
+            int x1 = std::min(w - 1, x + r);
+            uint8_t m = 0;
+            for (int xx = x0; xx <= x1; xx++) m = std::max(m, row[xx]);
+            out[x] = m;
+        }
+    }
+    std::vector<uint8_t> dst((size_t)w * h);
+    for (int x = 0; x < w; x++) {
+        for (int y = 0; y < h; y++) {
+            int y0 = std::max(0, y - r);
+            int y1 = std::min(h - 1, y + r);
+            uint8_t m = 0;
+            for (int yy = y0; yy <= y1; yy++) m = std::max(m, tmp[(size_t)yy * w + x]);
+            dst[(size_t)y * w + x] = m;
+        }
+    }
+    return dst;
+}
+
+} // anon
+
+void applyDepthMasks(InputData &data, const std::string &masksDir, int dilationPx) {
+    fs::path mdir(masksDir);
+    if (!fs::exists(mdir) || !fs::is_directory(mdir)) {
+        throw std::runtime_error("Masks directory not found: " + masksDir);
+    }
+
+    int applied = 0, missing = 0;
+    for (auto &cam : data.cameras) {
+        if (cam.image.empty()) continue;
+
+        fs::path imgPath(cam.filePath);
+        fs::path maskPath = mdir / (imgPath.stem().string() + ".png");
+        if (!fs::exists(maskPath)) { missing++; continue; }
+
+        int mw, mh;
+        std::vector<uint8_t> mask = readMaskGray(maskPath.string(), mw, mh);
+        if (mw != cam.image.width || mh != cam.image.height) {
+            mask = resizeMaskNN(mask, mw, mh, cam.image.width, cam.image.height);
+        }
+        if (dilationPx > 0) {
+            mask = dilateMax(mask, cam.image.width, cam.image.height, dilationPx);
+        }
+
+        // Background → white. Matches Colab's `img[mask < 128] = [255,255,255]`.
+        const size_t N = (size_t)cam.image.width * cam.image.height;
+        for (size_t i = 0; i < N; i++) {
+            if (mask[i] < 128) {
+                cam.image.data[i * 3 + 0] = 1.0f;
+                cam.image.data[i * 3 + 1] = 1.0f;
+                cam.image.data[i * 3 + 2] = 1.0f;
+            }
+        }
+        applied++;
+    }
+    std::cerr << "msplat: applied " << applied << " depth masks (dilation=" << dilationPx
+              << "px, missing=" << missing << ")\n";
+}
+
+// ── Random point cloud init (fallback when no SfM points present) ───────────
+
+void initializeRandomPoints(InputData &data, int64_t numPoints, float extent) {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> distXyz(-extent, extent);
+    std::uniform_int_distribution<int> distRgb(0, 255);
+
+    data.points.xyz.resize(numPoints * 3);
+    data.points.rgb.resize(numPoints * 3);
+    for (int64_t i = 0; i < numPoints; i++) {
+        data.points.xyz[i*3+0] = distXyz(rng);
+        data.points.xyz[i*3+1] = distXyz(rng);
+        data.points.xyz[i*3+2] = distXyz(rng);
+        data.points.rgb[i*3+0] = (uint8_t)distRgb(rng);
+        data.points.rgb[i*3+1] = (uint8_t)distRgb(rng);
+        data.points.rgb[i*3+2] = (uint8_t)distRgb(rng);
+    }
+    data.points.count = numPoints;
+}
+
 // ── Format dispatcher ───────────────────────────────────────────────────────
 
 InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
     fs::path root(path);
 
-    // Nerfstudio: transforms.json
-    if (fs::exists(root / "transforms.json"))
-        return loaders::loadNerfstudio(path);
+    InputData data;
+    if (fs::exists(root / "transforms.json")) {
+        data = loaders::loadNerfstudio(path);
+    } else if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin")) {
+        data = loaders::loadColmap(path, colmapImagePath);
+    } else if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json")) {
+        data = loaders::loadPolycam(path);
+    } else {
+        throw std::runtime_error("Unrecognized dataset format in: " + path +
+            "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+    }
 
-    // COLMAP: cameras.bin (direct or in sparse/0/)
-    if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin"))
-        return loaders::loadColmap(path, colmapImagePath);
+    if (data.points.count == 0) {
+        std::cerr << "msplat: no SfM point cloud found, seeding 100k random points "
+                     "(matches 3DGS/2DGS default behavior)\n";
+        initializeRandomPoints(data);
+    }
 
-    // Polycam: keyframes/ directory or cameras.json
-    if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json"))
-        return loaders::loadPolycam(path);
-
-    throw std::runtime_error("Unrecognized dataset format in: " + path +
-        "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+    return data;
 }

@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -92,6 +93,28 @@ int main(int argc, char *argv[]) {
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
 
+    // Facescan / Colab parity: per-frame foreground masks.
+    std::string masksDir;
+    app.add_option("--masks-dir", masksDir,
+        "Directory of per-frame foreground masks (PNG, white=foreground)");
+    int maskDilation = 8;
+    app.add_option("--mask-dilation", maskDilation,
+        "Dilate the foreground region by N pixels (matches PIL MaxFilter(2*r+1))");
+
+    // Phase 2b.2a validation hook: dump the initial scales tensor (after Model
+    // construction, before any training step) to a binary file, then exit.
+    std::string dumpInitScales;
+    app.add_option("--dump-init-scales", dumpInitScales,
+        "Dump initial scales tensor to <path> and exit (Phase 2b.2a validation)");
+
+    // Phase 2b.3.2 (6/N) smoke hook: load a PLY (3DGS or 2DGS) and render the
+    // first training camera with msplat_render, then exit. Reports min/max/mean
+    // and nonzero counts on out_img + the 2DGS side outputs (out_depth /
+    // out_normal). Run with MSPLAT_2DGS=1 to exercise the 2DGS forward path.
+    std::string renderOnly;
+    app.add_option("--render-only", renderOnly,
+        "Load <PLY>, render the first training camera, dump stats, then exit");
+
     CLI11_PARSE(app, argc, argv);
 
     if (validate || !valRender.empty()) validate = true;
@@ -103,6 +126,10 @@ int main(int argc, char *argv[]) {
 
         for (auto &cam : inputData.cameras)
             cam.loadImage(downScaleFactor);
+
+        if (!masksDir.empty()) {
+            applyDepthMasks(inputData, masksDir, maskDilation);
+        }
 
         std::vector<Camera> cams;
         std::vector<Camera> testCams;
@@ -124,6 +151,63 @@ int main(int argc, char *argv[]) {
                      numIters, keepCrs,
                      bgColor.data());
 
+        if (!dumpInitScales.empty()) {
+            msplat_gpu_sync();
+            MTensor cpu = model.scales.cpu();
+            std::ofstream o(dumpInitScales, std::ios::binary);
+            o.write(reinterpret_cast<const char*>(cpu.data<float>()), cpu.nbytes());
+            std::cout << "Dumped " << cpu.numel() << " floats ("
+                      << cpu.nbytes() << " bytes) of initial scales to "
+                      << dumpInitScales << std::endl;
+            return 0;
+        }
+
+        if (!renderOnly.empty()) {
+            if (cams.empty()) throw std::runtime_error("--render-only: no training cameras available");
+            std::cout << "Loading PLY: " << renderOnly << std::endl;
+            model.loadPly(renderOnly);
+            std::cout << "Loaded " << model.means.size(0) << " gaussians, scales shape ["
+                      << model.scales.size(0) << ", " << model.scales.size(1) << "]" << std::endl;
+
+            Camera &cam = cams[0];
+            std::cout << "Rendering camera: " << cam.filePath << "  ("
+                      << cam.width << "x" << cam.height << ")  fx=" << cam.fx << " fy=" << cam.fy << std::endl;
+
+            MTensor out_img = model.render(cam, 0);
+            msplat_gpu_sync();
+
+            auto report = [](const char *name, const MTensor &t) {
+                if (!t.defined()) { std::cout << "  " << name << ": <undefined>" << std::endl; return; }
+                const float *p = t.data<float>();
+                int64_t n = t.numel();
+                float mn = p[0], mx = p[0];
+                double sum = 0.0;
+                int64_t nz = 0;
+                for (int64_t i = 0; i < n; i++) {
+                    mn = std::min(mn, p[i]); mx = std::max(mx, p[i]); sum += p[i];
+                    if (p[i] != 0.0f) nz++;
+                }
+                std::cout << "  " << std::left << std::setw(11) << name << " shape=[";
+                for (size_t k = 0; k < t.shape().size(); k++) {
+                    std::cout << t.shape()[k] << (k + 1 < t.shape().size() ? ", " : "");
+                }
+                std::cout << "]  min=" << std::setw(11) << mn
+                          << "  max=" << std::setw(11) << mx
+                          << "  mean=" << std::setw(11) << (sum / std::max((int64_t)1, n))
+                          << "  nonzero=" << nz << "/" << n << std::endl;
+            };
+            std::cout << "Render done. Buffer stats:" << std::endl;
+            report("out_img",          out_img);
+            report("out_depth",        msplat_last_out_depth());
+            report("out_normal",       msplat_last_out_normal());
+            report("out_alpha",        msplat_last_out_alpha());
+            report("out_median_depth", msplat_last_out_median_depth());
+            report("out_distortion",   msplat_last_out_distortion());
+            return 0;
+        }
+
+        // M2.6: 2DGS training loop restored. The deleted 3DGS BENCHMARK
+        // harness + --val-render + --save-every will be re-added if needed.
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
         InfiniteRandomIterator<size_t> camsIter(camIndices);
@@ -131,135 +215,25 @@ int main(int argc, char *argv[]) {
         size_t step = 1;
         if (!resume.empty()) step = model.loadPly(resume) + 1;
 
-        bool benchmarking = std::getenv("BENCHMARK") != nullptr;
-        int bench_warmup = 50;
-        std::vector<double> bench_iter_ms, bench_cpu_ms, bench_drain_ms;
-        if (benchmarking) {
-            bench_iter_ms.reserve(numIters);
-            bench_cpu_ms.reserve(numIters);
-            bench_drain_ms.reserve(numIters);
-        }
-        auto cpu_now = []() { return std::chrono::high_resolution_clock::now(); };
-
-        auto bench_start = cpu_now();
+        auto train_t0 = std::chrono::high_resolution_clock::now();
         for (; step <= (size_t)numIters; step++) {
             Camera &cam = cams[camsIter.next()];
-
-            auto iter_start = cpu_now();
             MTensor gt = cam.getGPUImage(model.getDownscaleFactor(step));
-            model.fullIteration(cam, step, gt, ssimWeight);
+            float loss = model.fullIteration(cam, step, gt, ssimWeight);
             model.schedulersStep(step);
             model.afterTrain(step);
             msplat_commit();
 
-            if (benchmarking && step > (size_t)bench_warmup) {
-                auto pre_sync = cpu_now();
+            if (step == 1 || step % 100 == 0 || step == (size_t)numIters) {
                 msplat_gpu_sync();
-                auto iter_end = cpu_now();
-                double iter_ms = std::chrono::duration_cast<std::chrono::microseconds>(iter_end - iter_start).count() / 1000.0;
-                double cpu_ms = std::chrono::duration_cast<std::chrono::microseconds>(pre_sync - iter_start).count() / 1000.0;
-                double drain_ms = std::chrono::duration_cast<std::chrono::microseconds>(iter_end - pre_sync).count() / 1000.0;
-                bench_iter_ms.push_back(iter_ms);
-                bench_cpu_ms.push_back(cpu_ms);
-                bench_drain_ms.push_back(drain_ms);
-            }
-
-            if (saveEvery > 0 && step % saveEvery == 0) {
-                fs::path p(outputScene);
-                model.save(p.replace_filename(fs::path(p.stem().string() + "_" + std::to_string(step) + p.extension().string())).string(), step);
-            }
-
-            if (!valRender.empty() && step % 10 == 0) {
-                MTensor rgb = model.render(*valCam, step);
-                msplat_gpu_sync();
-                MTensor rgb_cpu = rgb.cpu();
-                Image valImg;
-                valImg.width = (int)rgb_cpu.size(1);
-                valImg.height = (int)rgb_cpu.size(0);
-                valImg.data.resize(valImg.width * valImg.height * 3);
-                memcpy(valImg.ptr(), rgb_cpu.data_ptr(), valImg.data.size() * sizeof(float));
-                imwriteRGB((fs::path(valRender) / (std::to_string(step) + ".png")).string(), valImg);
+                std::cout << "  iter " << std::setw(6) << step
+                          << "  loss=" << std::fixed << std::setprecision(6) << loss
+                          << "  N=" << model.means.size(0) << std::endl;
             }
         }
-
-        if (benchmarking && !bench_iter_ms.empty()) {
-            auto bench_end = cpu_now();
-            double total_s = std::chrono::duration_cast<std::chrono::milliseconds>(bench_end - bench_start).count() / 1000.0;
-            size_t n = bench_iter_ms.size();
-            std::vector<double> sorted = bench_iter_ms;
-            std::sort(sorted.begin(), sorted.end());
-            double sum = std::accumulate(sorted.begin(), sorted.end(), 0.0);
-            double mean = sum / n;
-            double median = (n % 2 == 0) ? (sorted[n/2-1] + sorted[n/2]) / 2.0 : sorted[n/2];
-            double sq_sum = 0;
-            for (double v : sorted) sq_sum += (v - mean) * (v - mean);
-            double stddev = std::sqrt(sq_sum / n);
-
-            std::cout << "\n=== Benchmark (" << n << " iters, " << bench_warmup << " warmup, " << total_s << "s total) ===\n";
-            std::cout << "  mean:   " << mean   << " ms/iter\n";
-            std::cout << "  median: " << median  << " ms/iter\n";
-            std::cout << "  stddev: " << stddev  << " ms/iter\n";
-            std::cout << "  p5:     " << sorted[(size_t)(n * 0.05)] << " ms/iter\n";
-            std::cout << "  p95:    " << sorted[(size_t)(n * 0.95)] << " ms/iter\n";
-            std::cout << "  min:    " << sorted.front() << " ms/iter\n";
-            std::cout << "  max:    " << sorted.back()  << " ms/iter\n";
-            std::cout << "  wall:   " << total_s << "s for " << numIters << " iters\n";
-
-            auto stats = [](std::vector<double> &v) {
-                std::vector<double> s = v;
-                std::sort(s.begin(), s.end());
-                size_t n = s.size();
-                double sum = std::accumulate(s.begin(), s.end(), 0.0);
-                double med = (n % 2 == 0) ? (s[n/2-1] + s[n/2]) / 2.0 : s[n/2];
-                return std::make_pair(sum / n, med);
-            };
-            auto [cpu_mean, cpu_med] = stats(bench_cpu_ms);
-            auto [drain_mean, drain_med] = stats(bench_drain_ms);
-            std::cout << "\n  --- CPU dispatch vs GPU drain ---\n";
-            std::cout << "  cpu dispatch:  mean=" << cpu_mean << "  median=" << cpu_med << " ms\n";
-            std::cout << "  gpu drain:     mean=" << drain_mean << "  median=" << drain_med << " ms\n";
-            std::cout << "  gpu fraction:  " << (drain_med / median * 100) << "%\n";
-
-            // GPU timing from completion handlers (PROFILE_GPU=1)
-            std::vector<double> gpu_times;
-            msplat_drain_gpu_times(gpu_times);
-            if (!gpu_times.empty()) {
-                auto [gpu_mean, gpu_med] = stats(gpu_times);
-                std::vector<double> gs = gpu_times;
-                std::sort(gs.begin(), gs.end());
-                std::cout << "\n  --- GPU kernel time (from CB completion handlers) ---\n";
-                std::cout << "  gpu exec:   mean=" << gpu_mean << "  median=" << gpu_med << " ms\n";
-                std::cout << "  gpu p5:     " << gs[(size_t)(gs.size() * 0.05)] << " ms\n";
-                std::cout << "  gpu p95:    " << gs[(size_t)(gs.size() * 0.95)] << " ms\n";
-                std::cout << "  gpu min:    " << gs.front() << " ms\n";
-                std::cout << "  gpu max:    " << gs.back() << " ms\n";
-                std::cout << "  n_cbs:      " << gs.size() << "\n";
-            }
-
-            // Per-stage GPU timing (PROFILE_STAGES=1)
-            constexpr int MAX_STAGES = 16;
-            std::vector<double> stage_times[MAX_STAGES];
-            const char* stage_names[MAX_STAGES] = {};
-            int n_stages = 0;
-            msplat_drain_stage_times(stage_times, MAX_STAGES, n_stages, stage_names);
-            bool has_stage_data = false;
-            for (int i = 0; i < n_stages; i++) if (!stage_times[i].empty()) { has_stage_data = true; break; }
-            if (has_stage_data) {
-                std::cout << "\n  --- Per-stage GPU time (Metal timestamp counters) ---\n";
-                double total_med = 0;
-                for (int i = 0; i < n_stages; i++) {
-                    if (stage_times[i].empty()) continue;
-                    auto [s_mean, s_med] = stats(stage_times[i]);
-                    total_med += s_med;
-                    std::cout << "  " << std::left << std::setw(22) << stage_names[i]
-                              << "median=" << std::fixed << std::setprecision(3) << s_med
-                              << "ms  mean=" << s_mean << "ms  (" << stage_times[i].size() << " samples)\n";
-                }
-                std::cout << "  " << std::left << std::setw(22) << "TOTAL (sum medians)"
-                          << std::fixed << std::setprecision(3) << total_med << "ms\n";
-            }
-            std::cout << "\n";
-        }
+        auto train_t1 = std::chrono::high_resolution_clock::now();
+        double train_s = std::chrono::duration_cast<std::chrono::milliseconds>(train_t1 - train_t0).count() / 1000.0;
+        std::cout << "Training done in " << train_s << "s (" << numIters << " iters)" << std::endl;
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene, numIters);

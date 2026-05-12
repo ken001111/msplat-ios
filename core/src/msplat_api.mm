@@ -112,12 +112,10 @@ Stats Trainer::step() {
     MTensor& gt = cam.getGPUImage(ds);
 
     auto t0 = std::chrono::high_resolution_clock::now();
-
-    impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
+    float loss = impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
     impl->model->schedulersStep(impl->currentStep);
     impl->model->afterTrain(impl->currentStep);
     msplat_commit();
-
     auto t1 = std::chrono::high_resolution_clock::now();
     float ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0f;
 
@@ -125,14 +123,13 @@ Stats Trainer::step() {
     s.iteration = impl->currentStep;
     s.splatCount = (int)impl->model->means.size(0);
     s.msPerStep = ms;
+    s.loss = loss;
     return s;
 }
 
 void Trainer::train(int callbackEvery) {
     while (impl->currentStep < impl->config.iterations) {
         step();
-        // Note: callbacks handled at the Swift level via polling iteration()
-        // to keep the C++ API free of function pointer complexity
     }
 }
 
@@ -332,7 +329,7 @@ void msplat_trainer_destroy(MsplatTrainer t) {
 
 MsplatStats msplat_trainer_step(MsplatTrainer t) {
     auto stats = static_cast<msplat::Trainer*>(t)->step();
-    return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep};
+    return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep, stats.loss};
 }
 
 void msplat_trainer_train(MsplatTrainer t) {

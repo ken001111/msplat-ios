@@ -9,6 +9,16 @@ int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
 float l1_loss(const MTensor& rendered, const MTensor& gt);
 
+// Per-gaussian scale-vector dimensionality. 3 for 3DGS (full ellipsoid),
+// 2 for 2DGS surfels (tangent-plane disc). Phase 2b.3.2 (5/N) flipped this
+// to 2 — the codebase now commits to 2DGS. Kept in lockstep with the
+// MSL-side `constant int kScaleDim` in core/metal/msplat_metal.metal; both
+// must move together. The legacy 3DGS forward/backward kernels still exist
+// but reading 3 scales from a [N,2] storage produces OOB / garbage, so they
+// will be retired (or made conditional) as Milestone 2 lands the 2DGS
+// backward port and msplat_train_step routes through 2DGS too.
+constexpr int kScaleDim = 2;
+
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
@@ -37,7 +47,9 @@ struct Model{
     float cam_pos[3];
   };
   CamSetup prepareCam(Camera& cam, int step);
-  void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
+  // Returns scalar loss value for the iteration. M2.6: re-introduced on the
+  // 2DGS-only train_step (msplat_train_step_2dgs + 6× fused_adam).
+  float fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
   MTensor render(Camera& cam, int step);
 
   MTensor means;

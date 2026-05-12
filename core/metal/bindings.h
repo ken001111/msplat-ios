@@ -32,6 +32,53 @@ void msplat_drain_gpu_times(std::vector<double>& out);
 void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages, int& n_stages,
                               const char** stage_names);
 
+// 2DGS forward side outputs from the most recent msplat_render call.
+// Populated by nd_rasterize_forward_2dgs_kernel — the only render path now.
+MTensor msplat_last_out_depth();          // (H, W) Float32 — alpha-weighted depth
+MTensor msplat_last_out_normal();         // (H, W, 3) Float32 — alpha-weighted world-space normal
+// M2.1: backward-replay state + regularizer inputs.
+MTensor msplat_last_out_alpha();          // (H, W) Float32 — 1 - T_final
+MTensor msplat_last_out_median_depth();   // (H, W) Float32 — depth where T crosses 0.5
+MTensor msplat_last_out_distortion();     // (H, W) Float32 — depth-distortion regularizer
+
+// M2.5: full 2DGS training step (forward + loss + backward — no Adam yet).
+// Encodes the forward 2DGS pipeline, computes L1+distortion loss against gt,
+// runs the backward rasterizer + project + SH chain rule. Returns
+// (radii [N], loss_value). The per-gaussian gradient buffers live in
+// g_tcache and are accessed via msplat_last_dL_d* accessors below.
+std::tuple<MTensor, float> msplat_train_step_2dgs(
+    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
+    MTensor &quats, MTensor &viewmat, MTensor &projmat,
+    float fx, float fy, float cx, float cy,
+    unsigned img_height, unsigned img_width,
+    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
+    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
+    MTensor &features_dc, MTensor &features_rest,
+    MTensor &opacities, MTensor &background,
+    MTensor &gt, int features_rest_bases,
+    float lambda_l1, float lambda_dist);
+
+// M2.6: dispatch fused_adam_kernel on a single parameter group. Sized in
+// flat float count; for [N, K] tensors pass n = N*K. Asynchronous — caller
+// is expected to msplat_commit + msplat_gpu_sync at end-of-iter.
+void msplat_fused_adam(
+    MTensor &params, MTensor &grads,
+    MTensor &exp_avg, MTensor &exp_avg_sq,
+    uint32_t n,
+    float step_size, float beta1, float beta2,
+    float bc2_sqrt, float eps);
+
+// M2.3/M2.4 per-gaussian gradient accessors — read by Model::fullIteration
+// to feed into fused_adam_kernel (M2.6).
+MTensor msplat_last_dL_dmean3D();
+MTensor msplat_last_dL_dscale();
+MTensor msplat_last_dL_dquat();
+MTensor msplat_last_dL_dopacity();
+MTensor msplat_last_dL_dfeatures_dc();
+MTensor msplat_last_dL_dfeatures_rest();
+MTensor msplat_last_dL_dmean2D();   // overwritten by project backward for densify stats
+MTensor msplat_last_radii();        // forward output (per-gaussian int)
+
 // Render-only forward pass (no loss computation)
 // Returns: out_img (H, W, 3) as MTensor
 MTensor msplat_render(
@@ -45,26 +92,8 @@ MTensor msplat_render(
     MTensor &opacities, MTensor &background
 );
 
-// Fused forward + backward + Adam + grad_stats in one encoder
-// Returns: (radii [N], loss_value float)
-std::tuple<MTensor, float> msplat_train_step(
-    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
-    MTensor &quats, MTensor &viewmat, MTensor &projmat,
-    float fx, float fy, float cx, float cy,
-    unsigned img_height, unsigned img_width,
-    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
-    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
-    MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background,
-    MTensor &gt, MTensor &window2d, float ssim_weight,
-    float loss_inv_n, int features_rest_bases,
-    int num_adam_groups,
-    MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
-    float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps,
-    MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
-);
+// msplat_train_step removed — 3DGS training path retired in Phase 2b cleanup.
+// The 2DGS backward port + corresponding train_step land in Milestone 2.
 
 int msplat_densify(
     int N, int buf_capacity,

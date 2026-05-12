@@ -59,6 +59,7 @@ typedef struct {
     int iteration;
     int splatCount;
     float msPerStep;
+    float loss;        // M2.6: scalar L1+distortion loss from the iteration
 } MsplatStats;
 
 typedef struct {
