@@ -526,7 +526,11 @@ static void forward_pipeline(
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y,
         (uint32_t)std::get<2>(tile_bounds), 0xDEAD
     });
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    // Pad to 16 bytes so iOS Metal validator accepts it as a `constant float3&` —
+    // float3 is SIMD-aligned to 16 bytes on Apple GPUs. macOS Metal is lenient
+    // about the 12-byte case but iOS rejects with "argument has length(12),
+    // kernel expects 16".
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
@@ -783,7 +787,11 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
     auto proj_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
     auto tile_bounds_arr = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y, (uint32_t)std::get<2>(tile_bounds), 0xDEAD});
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    // Pad to 16 bytes so iOS Metal validator accepts it as a `constant float3&` —
+    // float3 is SIMD-aligned to 16 bytes on Apple GPUs. macOS Metal is lenient
+    // about the 12-byte case but iOS rejects with "argument has length(12),
+    // kernel expects 16".
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
     auto img_size_dim2 = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
