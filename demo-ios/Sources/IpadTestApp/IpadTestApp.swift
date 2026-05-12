@@ -70,10 +70,16 @@ final class Engine: ObservableObject {
         Thread.detachNewThread { [weak self] in
             guard let self else { return }
             autoreleasepool {
-                let dataset = GaussianDataset(path: datasetPath)
+                // iPad memory budget: load images at half resolution. 148 frames at
+                // 1280x720 RGB float32 = ~1.6 GB just for gt — would jetsam on iOS's
+                // ~3 GB per-app foreground limit. Halving W and H drops gt to ~400 MB,
+                // well within budget. The model itself stays the same.
+                let dataset = GaussianDataset(path: datasetPath, downscaleFactor: 2.0)
                 var config = TrainingConfig()
                 config.iterations = Int32(iterations)
-                config.numDownscales = 0
+                // Use default numDownscales (2 — train at 1/4 res for first 3000 iters)
+                // so the early training is even cheaper. macOS demo overrode this to 0
+                // for max quality; iPad keeps the default.
                 config.bgColor = (0, 0, 0)
                 let trainer = GaussianTrainer(dataset: dataset, config: config)
 
