@@ -16,6 +16,9 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     int numDc = (int)p.featuresDc.size(1);
     int frBases = (int)p.featuresRest.size(-2);
     int numFr = frBases * 3;
+    // 2DGS scenes carry 2 in-plane scales; 3DGS carries 3 axis scales.
+    // Driven off the tensor shape so the writer tracks kScaleDim automatically.
+    int numScales = (int)p.scales.size(1);
 
     o << "ply\nformat binary_little_endian 1.0\n";
     o << "comment msplat v" << step << "\n";
@@ -25,11 +28,11 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     for (int i = 0; i < numDc; i++) o << "property float f_dc_" << i << "\n";
     for (int i = 0; i < numFr; i++) o << "property float f_rest_" << i << "\n";
     o << "property float opacity\n";
-    o << "property float scale_0\nproperty float scale_1\nproperty float scale_2\n";
+    for (int i = 0; i < numScales; i++) o << "property float scale_" << i << "\n";
     o << "property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n";
     o << "end_header\n";
 
-    int floatsPerRow = 3 + 3 + numDc + numFr + 1 + 3 + 4;
+    int floatsPerRow = 3 + 3 + numDc + numFr + 1 + numScales + 4;
     std::vector<float> row(floatsPerRow);
     const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
     const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
@@ -46,8 +49,8 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
             for (int b = 0; b < frBases; b++)
                 row[c++] = frp[i*frBases*3 + b*3 + ch];
         row[c++] = op[i];
-        for (int j = 0; j < 3; j++)
-            row[c++] = p.keepCrs ? std::log(std::exp(sp[i*3+j]) / p.scale) : sp[i*3+j];
+        for (int j = 0; j < numScales; j++)
+            row[c++] = p.keepCrs ? std::log(std::exp(sp[i*numScales+j]) / p.scale) : sp[i*numScales+j];
         for (int j = 0; j < 4; j++) row[c++] = qp[i*4+j];
 
         o.write(reinterpret_cast<const char*>(row.data()), floatsPerRow * sizeof(float));
@@ -59,13 +62,18 @@ void saveGaussianSplat(const std::string &path, GaussianParams &p) {
 
     std::ofstream o(path, std::ios::binary);
     int64_t N = p.means.size(0);
+    int numScales = (int)p.scales.size(1);
     const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
     const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
 
-    // Sort by size/opacity (largest first)
+    // Sort by size/opacity (largest first). For 2DGS the size estimate is just
+    // the sum of in-plane radii — surfels are flat discs, no third axis to
+    // contribute. SPLAT viewers see a slightly different sort order than the
+    // 3DGS equivalent, which is acceptable for a thumbnail-tier export.
     std::vector<float> order(N);
     for (int64_t i = 0; i < N; i++) {
-        float s = std::exp(sp[i*3]) + std::exp(sp[i*3+1]) + std::exp(sp[i*3+2]);
+        float s = 0.0f;
+        for (int j = 0; j < numScales; j++) s += std::exp(sp[i*numScales+j]);
         if (p.keepCrs) s /= p.scale;
         order[i] = s / (1.0f + std::exp(-op[i]));
     }
@@ -79,8 +87,13 @@ void saveGaussianSplat(const std::string &path, GaussianParams &p) {
         for (int j = 0; j < 3; j++) m[j] = p.keepCrs ? (mp[i*3+j] / p.scale + p.translation[j]) : mp[i*3+j];
         o.write(reinterpret_cast<const char*>(m), 12);
 
-        float sc[3];
-        for (int j = 0; j < 3; j++) sc[j] = p.keepCrs ? (std::exp(sp[i*3+j]) / p.scale) : std::exp(sp[i*3+j]);
+        // SPLAT format is 3DGS-shaped: always 3 scale floats. For 2DGS surfels
+        // we pad the missing axis with a small flat value so the viewer renders
+        // them as thin discs instead of degenerate points.
+        float sc[3] = {0.0f, 0.0f, 0.0f};
+        for (int j = 0; j < numScales && j < 3; j++)
+            sc[j] = p.keepCrs ? (std::exp(sp[i*numScales+j]) / p.scale) : std::exp(sp[i*numScales+j]);
+        if (numScales < 3) sc[2] = 1e-5f;
         o.write(reinterpret_cast<const char*>(sc), 12);
 
         uint8_t rgb[3];
@@ -107,6 +120,9 @@ LoadedGaussians loadGaussianPly(const std::string &path, float scale, const floa
     std::string line;
     int numPoints = 0, step = 0;
     int numDc = 0, numFr = 0;
+    // Count scale_N properties — 3 for msplat/3DGS, 2 for Colab-trained 2DGS.
+    // Driven off the header so both formats round-trip through the same loader.
+    int numScales = 0;
 
     std::getline(f, line); // "ply"
     if (line.find("ply") == std::string::npos) throw std::runtime_error("Not a PLY file: " + path);
@@ -125,17 +141,20 @@ LoadedGaussians loadGaussianPly(const std::string &path, float scale, const floa
 
         if (line.rfind("property float f_dc_", 0) == 0) numDc++;
         if (line.rfind("property float f_rest_", 0) == 0) numFr++;
+        if (line.rfind("property float scale_", 0) == 0) numScales++;
     }
 
     if (numPoints == 0) throw std::runtime_error("PLY has no vertices");
+    if (numScales != 2 && numScales != 3)
+        throw std::runtime_error("PLY: expected 2 (2DGS) or 3 (3DGS) scale properties, got " + std::to_string(numScales));
     int frBases = numFr / 3;
 
-    // Read binary data: xyz(3) + normals(3) + f_dc(numDc) + f_rest(numFr) + opacity(1) + scale(3) + rot(4)
+    // Read binary data: xyz(3) + normals(3) + f_dc(numDc) + f_rest(numFr) + opacity(1) + scale(numScales) + rot(4)
     std::vector<float> meansRaw(numPoints * 3);
     std::vector<float> dcRaw(numPoints * numDc);
     std::vector<float> frRaw(numPoints * numFr);
     std::vector<float> opRaw(numPoints);
-    std::vector<float> scRaw(numPoints * 3);
+    std::vector<float> scRaw(numPoints * numScales);
     std::vector<float> qtRaw(numPoints * 4);
     float normals[3];
 
@@ -145,7 +164,7 @@ LoadedGaussians loadGaussianPly(const std::string &path, float scale, const floa
         f.read(reinterpret_cast<char*>(&dcRaw[i*numDc]), numDc * 4);
         f.read(reinterpret_cast<char*>(&frRaw[i*numFr]), numFr * 4);
         f.read(reinterpret_cast<char*>(&opRaw[i]), 4);
-        f.read(reinterpret_cast<char*>(&scRaw[i*3]), 12);
+        f.read(reinterpret_cast<char*>(&scRaw[i*numScales]), numScales * 4);
         f.read(reinterpret_cast<char*>(&qtRaw[i*4]), 16);
     }
 
@@ -154,7 +173,7 @@ LoadedGaussians loadGaussianPly(const std::string &path, float scale, const floa
         for (int i = 0; i < numPoints; i++)
             for (int j = 0; j < 3; j++)
                 meansRaw[i*3+j] = (meansRaw[i*3+j] - translation[j]) * scale;
-        for (int i = 0; i < numPoints * 3; i++)
+        for (int i = 0; i < numPoints * numScales; i++)
             scRaw[i] = std::log(scale * std::exp(scRaw[i]));
     }
 
@@ -169,7 +188,7 @@ LoadedGaussians loadGaussianPly(const std::string &path, float scale, const floa
     g.means = upload({(int64_t)numPoints, 3}, meansRaw.data(), meansRaw.size() * 4);
     g.featuresDc = upload({(int64_t)numPoints, (int64_t)numDc}, dcRaw.data(), dcRaw.size() * 4);
     g.opacities = upload({(int64_t)numPoints, 1}, opRaw.data(), opRaw.size() * 4);
-    g.scales = upload({(int64_t)numPoints, 3}, scRaw.data(), scRaw.size() * 4);
+    g.scales = upload({(int64_t)numPoints, (int64_t)numScales}, scRaw.data(), scRaw.size() * 4);
     g.quats = upload({(int64_t)numPoints, 4}, qtRaw.data(), qtRaw.size() * 4);
 
     // Transpose featuresRest: PLY [N, 3, frBases] → internal [N, frBases, 3]
