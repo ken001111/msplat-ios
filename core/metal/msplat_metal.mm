@@ -579,6 +579,13 @@ static void forward_pipeline(
             fprintf(stderr, "===========================\n\n");
     }
 
+    // 2DGS dispatch gate (Phase 2b.3.2). Set MSPLAT_2DGS=1 to route through the
+    // 2DGS forward kernels shipped in 2b.3.1. Render-only for now — the training
+    // pipeline still uses the 3DGS kernels because the 2DGS backward path is
+    // not yet ported. getenv cached in a static across render calls.
+    static const char* env_2dgs_val = std::getenv("MSPLAT_2DGS");
+    const bool is_2dgs = env_2dgs_val && env_2dgs_val[0] == '1';
+
     // Helper lambdas to encode each stage onto a given encoder
     auto encode_proj_sh = [&](id<MTLComputeCommandEncoder> enc) {
         NSUInteger tpg = MIN(ctx->project_and_sh_forward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
@@ -697,6 +704,101 @@ static void forward_pipeline(
         }
     };
 
+    // ===== 2DGS forward dispatch (Phase 2b.3.2) =====
+    // Mirror of the 3DGS lambdas above, retargeted at the 2DGS kernel variants.
+    // Only the project and sort+pack arg layouts differ; the scatter+prefix-sum
+    // pair is shared (it indexes tile_offsets / prealloc_bins, which are
+    // pack-format-agnostic). No chunked rasterizer variant yet — Milestone 1
+    // covers monolithic only.
+
+    auto encode_proj_sh_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->project_and_sh_forward_2dgs_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->project_and_sh_forward_2dgs_kernel_cpso];
+        ENC_SCALAR(enc, num_points_u32, 0);
+        ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
+        ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
+        ENC_BUF(enc, viewmat, 5); ENC_BUF(enc, projmat, 6);
+        [enc setBytes:proj_intrins->data() length:sizeof(*proj_intrins) atIndex:7];
+        [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:8];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:9];
+        ENC_SCALAR(enc, clip_thresh, 10);
+        ENC_BUF(enc, xys, 11); ENC_BUF(enc, depths, 12);
+        ENC_BUF(enc, radii_out, 13);
+        ENC_BUF(enc, g_tcache.transMats, 14);          // replaces 3DGS `conics`
+        ENC_BUF(enc, num_tiles_hit, 15);
+        ENC_BUF(enc, g_tcache.normal_opacity, 16);     // float4: (n.xyz, raw opac logit)
+        ENC_BUF(enc, opacities, 17);                   // raw logit-space, passed through to normal_opacity.w
+        ENC_SCALAR(enc, degree, 18); ENC_SCALAR(enc, degrees_to_use, 19);
+        [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:20];
+        ENC_BUF(enc, features_dc, 21); ENC_BUF(enc, features_rest, 22);
+        ENC_BUF(enc, colors, 23); ENC_BUF(enc, aabb, 24);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    auto encode_prefix_map_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        uint32_t num_tiles_u32 = (uint32_t)num_tiles;
+        // 1. scatter_to_prealloc_bins — identical to 3DGS path.
+        {
+            NSUInteger tpg = MIN(ctx->scatter_to_prealloc_bins_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->scatter_to_prealloc_bins_kernel_cpso];
+            ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, depths, 2);
+            ENC_BUF(enc, radii_out, 3); ENC_BUF(enc, aabb, 4);
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
+            ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 7);
+            ENC_BUF(enc, g_tcache.overflow_flag, 8);
+            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // 2. prefix_sum — identical to 3DGS path.
+        {
+            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
+            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
+            ENC_SCALAR(enc, num_tiles_u32, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1); ENC_BUF(enc, g_tcache.tile_offsets, 2);
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // 3. bitonic_sort_per_tile_2dgs — swaps in transMats + normal_opacity inputs;
+        //    emits the 2DGS sorted-surfel pack (xy / transmat / normal+sigmoid(opac) / rgb).
+        {
+            [enc setComputePipelineState:ctx->bitonic_sort_per_tile_2dgs_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_offsets, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 2);
+            ENC_BUF(enc, gaussian_ids, 3);
+            ENC_SCALAR(enc, num_tiles_u32, 4);
+            ENC_BUF(enc, xys, 5);
+            ENC_BUF(enc, g_tcache.transMats, 6);           // replaces 3DGS `conics`
+            ENC_BUF(enc, g_tcache.normal_opacity, 7);      // float4 with raw opac in .w
+            ENC_BUF(enc, colors, 8);
+            ENC_BUF(enc, g_tcache.packed_xy, 9);
+            ENC_BUF(enc, g_tcache.packed_transmat, 10);
+            ENC_BUF(enc, g_tcache.packed_normal_opac, 11); // .w := sigmoid(raw)
+            ENC_BUF(enc, packed_rgb, 12);
+            ENC_BUF(enc, tile_bins, 13);
+            [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+    };
+
+    auto encode_rast_fwd_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
+        // Monolithic only — no chunked variant in 2DGS yet (Milestone 1 scope).
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->nd_rasterize_forward_2dgs_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
+        ENC_BUF(enc, g_tcache.packed_xy, 4);
+        ENC_BUF(enc, g_tcache.packed_normal_opac, 5);
+        ENC_BUF(enc, g_tcache.packed_transmat, 6);
+        ENC_BUF(enc, packed_rgb, 7);
+        ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, out_img, 10);
+        ENC_BUF(enc, g_tcache.out_depth, 11);
+        ENC_BUF(enc, g_tcache.out_normal, 12);
+        ENC_BUF(enc, background, 13);
+        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:14];
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
+    };
+
     auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
         // Separable SSIM forward: H conv → barrier → V conv + SSIM + reduction
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
@@ -762,11 +864,19 @@ static void forward_pipeline(
             id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
             assert(encoder && "Failed to create compute command encoder");
 
-            encode_proj_sh(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_prefix_map(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_fwd(encoder);
+            if (is_2dgs) {
+                encode_proj_sh_2dgs(encoder);
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_prefix_map_2dgs(encoder);
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_rast_fwd_2dgs(encoder);
+            } else {
+                encode_proj_sh(encoder);
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_prefix_map(encoder);
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_rast_fwd(encoder);
+            }
             if (compute_loss) {
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 encode_loss_fwd(encoder);
