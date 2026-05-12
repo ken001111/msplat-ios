@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -100,6 +101,12 @@ int main(int argc, char *argv[]) {
     app.add_option("--mask-dilation", maskDilation,
         "Dilate the foreground region by N pixels (matches PIL MaxFilter(2*r+1))");
 
+    // Phase 2b.2a validation hook: dump the initial scales tensor (after Model
+    // construction, before any training step) to a binary file, then exit.
+    std::string dumpInitScales;
+    app.add_option("--dump-init-scales", dumpInitScales,
+        "Dump initial scales tensor to <path> and exit (Phase 2b.2a validation)");
+
     CLI11_PARSE(app, argc, argv);
 
     if (validate || !valRender.empty()) validate = true;
@@ -135,6 +142,17 @@ int main(int argc, char *argv[]) {
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs,
                      bgColor.data());
+
+        if (!dumpInitScales.empty()) {
+            msplat_gpu_sync();
+            MTensor cpu = model.scales.cpu();
+            std::ofstream o(dumpInitScales, std::ios::binary);
+            o.write(reinterpret_cast<const char*>(cpu.data<float>()), cpu.nbytes());
+            std::cout << "Dumped " << cpu.numel() << " floats ("
+                      << cpu.nbytes() << " bytes) of initial scales to "
+                      << dumpInitScales << std::endl;
+            return 0;
+        }
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
