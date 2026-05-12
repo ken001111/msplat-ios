@@ -1734,15 +1734,23 @@ kernel void nd_rasterize_backward_2dgs_kernel(
             float dL_dalpha = 0.0f;
             const int global_id = collected_id[j2];
 
-            // Propagate gradients on color.
+            // Propagate gradients on color. Forward applies max(raw + 0.5, 0)
+            // when loading packed_rgb into the rasterizer's batch — so the
+            // value that actually contributes to pix_color is the post-clamp.
+            // Backward replays that: use the post-clamp value in the
+            // (c - accum_rec) chain, and mask the dL/d(raw) gradient with
+            // the clamp's derivative.
             for (int ch = 0; ch < 3; ch++) {
-                const float c = collected_rgb[j2][ch];
+                const float c_raw  = collected_rgb[j2][ch];
+                const float c_used = max(c_raw + 0.5f, 0.0f);
+                const float dc_used_dc_raw = (c_raw + 0.5f > 0.0f) ? 1.0f : 0.0f;
                 accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-                last_color[ch] = c;
+                last_color[ch] = c_used;
                 const float dL_dch = dL_dpixel[ch];
-                dL_dalpha += (c - accum_rec[ch]) * dL_dch;
-                // dL_dcolors[global_id*3 + ch] += dchannel_dcolor * dL_dch
-                atomic_fetch_add_explicit(&dL_dcolors[3 * global_id + ch], dchannel_dcolor * dL_dch, memory_order_relaxed);
+                dL_dalpha += (c_used - accum_rec[ch]) * dL_dch;
+                atomic_fetch_add_explicit(&dL_dcolors[3 * global_id + ch],
+                                          dchannel_dcolor * dL_dch * dc_used_dc_raw,
+                                          memory_order_relaxed);
             }
 
             // Aux-output gradients: median depth, distortion, depth, alpha, normal.
