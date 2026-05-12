@@ -487,8 +487,7 @@ void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
 }
 
-// Internal forward pipeline — used by both msplat_render and msplat_train_step.
-// When compute_loss=false, gt/window2d/ssim_weight are ignored.
+// Internal forward pipeline — render-only. 2DGS dispatch.
 static void forward_pipeline(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
@@ -497,9 +496,7 @@ static void forward_pipeline(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background,
-    MTensor &gt, MTensor &window2d, float ssim_weight,
-    bool compute_loss
+    MTensor &opacities, MTensor &background
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -530,22 +527,15 @@ static void forward_pipeline(
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
     MTensor &radii_out = g_tcache.radii_out;
-    MTensor &conics = g_tcache.conics;
     MTensor &num_tiles_hit = g_tcache.num_tiles_hit;
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
     MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &tile_bins = g_tcache.tile_bins;
-    MTensor &loss_sum = g_tcache.loss_sum;
-    MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
-    MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
     MTensor &out_img = g_tcache.out_img;
     MTensor &final_Ts = g_tcache.final_Ts;
     MTensor &final_idx = g_tcache.final_idx;
-    MTensor &loss_intermediates = g_tcache.loss_intermediates;
-
-    auto loss_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
 
     // --- Constants (heap-allocated for Obj-C block) ---
     auto proj_intrins = std::make_shared<std::array<float, 4>>(std::array<float, 4>{fx, fy, cx, cy});
@@ -556,8 +546,6 @@ static void forward_pipeline(
     });
     auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
     uint32_t num_points_u32 = (uint32_t)num_points;
-    uint32_t capacity_u32 = (uint32_t)capacity;
-    uint32_t prefix_N = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
 
@@ -579,137 +567,12 @@ static void forward_pipeline(
             fprintf(stderr, "===========================\n\n");
     }
 
-    // 2DGS dispatch gate (Phase 2b.3.2). Set MSPLAT_2DGS=1 to route through the
-    // 2DGS forward kernels shipped in 2b.3.1. Render-only for now — the training
-    // pipeline still uses the 3DGS kernels because the 2DGS backward path is
-    // not yet ported. getenv cached in a static across render calls.
-    static const char* env_2dgs_val = std::getenv("MSPLAT_2DGS");
-    const bool is_2dgs = env_2dgs_val && env_2dgs_val[0] == '1';
-
-    // Helper lambdas to encode each stage onto a given encoder
-    auto encode_proj_sh = [&](id<MTLComputeCommandEncoder> enc) {
-        NSUInteger tpg = MIN(ctx->project_and_sh_forward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-        [enc setComputePipelineState:ctx->project_and_sh_forward_kernel_cpso];
-        ENC_SCALAR(enc, num_points_u32, 0);
-        ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
-        ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
-        ENC_BUF(enc, viewmat, 5); ENC_BUF(enc, projmat, 6);
-        [enc setBytes:proj_intrins->data() length:sizeof(*proj_intrins) atIndex:7];
-        [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:8];
-        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:9];
-        ENC_SCALAR(enc, clip_thresh, 10);
-        ENC_BUF(enc, xys, 11); ENC_BUF(enc, depths, 12);
-        ENC_BUF(enc, radii_out, 13); ENC_BUF(enc, conics, 14);
-        ENC_BUF(enc, num_tiles_hit, 15);
-        ENC_SCALAR(enc, degree, 16); ENC_SCALAR(enc, degrees_to_use, 17);
-        [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
-        ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
-        ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
-        // buffer 23 removed (was opacity-aware AABB, reverted)
-
-        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-    };
-
-    auto encode_prefix_map = [&](id<MTLComputeCommandEncoder> enc) {
-        uint32_t num_tiles_u32 = (uint32_t)num_tiles;
-        // 1. scatter_to_prealloc_bins (replaces count_intersections + scatter_to_tiles)
-        {
-            NSUInteger tpg = MIN(ctx->scatter_to_prealloc_bins_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->scatter_to_prealloc_bins_kernel_cpso];
-            ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, depths, 2);
-            ENC_BUF(enc, radii_out, 3); ENC_BUF(enc, aabb, 4);
-            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
-            ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
-            ENC_BUF(enc, g_tcache.prealloc_bins, 7);
-            ENC_BUF(enc, g_tcache.overflow_flag, 8);
-            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 2. prefix_sum(tile_scatter_counters -> tile_offsets)
-        {
-            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
-            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
-            ENC_SCALAR(enc, num_tiles_u32, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1); ENC_BUF(enc, g_tcache.tile_offsets, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 3. bitonic_sort_per_tile (reads prealloc_bins, writes packed + tile_bins)
-        {
-            [enc setComputePipelineState:ctx->bitonic_sort_per_tile_kernel_cpso];
-            ENC_BUF(enc, g_tcache.tile_offsets, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1);
-            ENC_BUF(enc, g_tcache.prealloc_bins, 2);
-            ENC_BUF(enc, gaussian_ids, 3);
-            ENC_SCALAR(enc, num_tiles_u32, 4);
-            ENC_BUF(enc, xys, 5); ENC_BUF(enc, conics, 6);
-            ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
-            ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
-            ENC_BUF(enc, tile_bins, 12);
-            [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        }
-    };
-
-    // K_max for chunked rasterization — set after GPU readback
-    uint32_t K_max = 1;
-    constexpr uint32_t CHUNK_SIZE = 512;
-
-    auto encode_rast_fwd_monolithic = [&](id<MTLComputeCommandEncoder> enc) {
-        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
-        MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
-        [enc setComputePipelineState:ctx->nd_rasterize_forward_kernel_cpso];
-        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
-        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
-        ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
-        ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
-        ENC_BUF(enc, final_Ts, 7); ENC_BUF(enc, final_idx, 8); ENC_BUF(enc, out_img, 9);
-        ENC_BUF(enc, background, 10);
-        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:11];
-        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
-    };
-
-    auto encode_rast_fwd_chunked = [&](id<MTLComputeCommandEncoder> enc) {
-        // Phase 1: dispatch forward chunked kernel — grid (tile_x, tile_y, K_max)
-        uint32_t tile_x = (img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X;
-        uint32_t tile_y = (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y;
-        uint32_t num_pix = img_width * img_height;
-        auto img_sz_2 = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
-        MTLSize chunked_tg = MTLSizeMake(tile_x, tile_y, K_max);
-        MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
-        [enc setComputePipelineState:ctx->rasterize_forward_chunked_kernel_cpso];
-        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
-        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
-        ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
-        ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
-        ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
-        ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
-        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
-        [enc dispatchThreadgroups:chunked_tg threadsPerThreadgroup:tg_size];
-
-        // Phase 2: merge kernel — one thread per pixel
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        NSUInteger merge_tpg = 256;
-        [enc setComputePipelineState:ctx->rasterize_forward_merge_kernel_cpso];
-        ENC_SCALAR(enc, num_pix, 0); ENC_SCALAR(enc, K_max, 1);
-        ENC_BUF(enc, g_tcache.chunk_T, 2); ENC_BUF(enc, g_tcache.chunk_C, 3); ENC_BUF(enc, g_tcache.chunk_final_idx, 4);
-        ENC_BUF(enc, final_Ts, 5); ENC_BUF(enc, final_idx, 6); ENC_BUF(enc, out_img, 7);
-        ENC_BUF(enc, background, 8);
-        [enc setBytes:img_sz_2->data() length:sizeof(*img_sz_2) atIndex:9];
-        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-    };
-
-    auto encode_rast_fwd = [&](id<MTLComputeCommandEncoder> enc) {
-        if (K_max <= 1) {
-            encode_rast_fwd_monolithic(enc);
-        } else {
-            encode_rast_fwd_chunked(enc);
-        }
-    };
-
-    // ===== 2DGS forward dispatch (Phase 2b.3.2) =====
-    // Mirror of the 3DGS lambdas above, retargeted at the 2DGS kernel variants.
-    // Only the project and sort+pack arg layouts differ; the scatter+prefix-sum
-    // pair is shared (it indexes tile_offsets / prealloc_bins, which are
-    // pack-format-agnostic). No chunked rasterizer variant yet — Milestone 1
-    // covers monolithic only.
+    // ===== 2DGS forward dispatch =====
+    // The codebase committed to 2DGS in Phase 2b.3.2 (5/N) — kScaleDim=2,
+    // float2 scales storage. The 3DGS dispatch lambdas and env-var gate
+    // were removed in the post-Milestone-1 cleanup. forward_pipeline is
+    // called only from msplat_render (compute_loss=false); training has
+    // no forward path yet (deferred to Milestone 2).
 
     auto encode_proj_sh_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
         NSUInteger tpg = MIN(ctx->project_and_sh_forward_2dgs_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
@@ -799,64 +662,14 @@ static void forward_pipeline(
         [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
     };
 
-    auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
-        // Separable SSIM forward: H conv → barrier → V conv + SSIM + reduction
-        MTLSize grid = MTLSizeMake(img_width, img_height, 1);
-        MTLSize tg = MTLSizeMake(16, 16, 1);
-
-        // Pass 1: horizontal convolution
-        [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
-        [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
-        ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // Pass 2: vertical convolution + SSIM/L1 + loss reduction
-        [enc setComputePipelineState:ctx->ssim_v_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
-        ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
-        [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
-        ENC_SCALAR(enc, ssim_weight, 4);
-        ENC_BUF(enc, loss_intermediates, 5); ENC_BUF(enc, loss_sum, 6);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-    };
-
-    // Zero cached buffers will be done inside the command encoder via blit.
-    // (CPU memset would race with previous CB's GPU reads.)
-
-    // Compute K_max conservatively from CPU-side data (no GPU sync needed).
-    // avg_per_tile = capacity / num_tiles. Use 6x average to cover heavy-tailed
-    // tile distributions. Overestimate is cheap: empty chunks early-exit immediately.
-    // If the densest tile exceeds K_max * CHUNK_SIZE, those gaussians are silently
-    // skipped — but 6x covers typical skew (measured max/avg ratio: ~1.5-2.5x).
-    if (num_tiles >= 400) {
-        // High-res: enough tiles for good GPU occupancy, skip chunking
-        K_max = 1;
-    } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;  // 6x average — covers heavy-tailed distributions
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
-    }
-    g_tcache.current_K_max = K_max;
-    if (K_max > 1) {
-        g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
-    }
-
     {
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
         assert(command_buffer && "Failed to retrieve command buffer reference");
 
         dispatch_sync(ctx->d_queue, ^(){
             // Blit-zero buffers that accumulate across gaussians (must be GPU-side
-            // to avoid racing with previous CB's reads on pipelined execution)
+            // to avoid racing with previous CB's reads on pipelined execution).
             id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
-            // tile_bins written by sort kernel, tile_counts no longer used
-            [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
             [blit endEncoding];
@@ -864,23 +677,11 @@ static void forward_pipeline(
             id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
             assert(encoder && "Failed to create compute command encoder");
 
-            if (is_2dgs) {
-                encode_proj_sh_2dgs(encoder);
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                encode_prefix_map_2dgs(encoder);
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                encode_rast_fwd_2dgs(encoder);
-            } else {
-                encode_proj_sh(encoder);
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                encode_prefix_map(encoder);
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                encode_rast_fwd(encoder);
-            }
-            if (compute_loss) {
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                encode_loss_fwd(encoder);
-            }
+            encode_proj_sh_2dgs(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_prefix_map_2dgs(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_rast_fwd_2dgs(encoder);
 
             [encoder endEncoding];
         });
@@ -899,12 +700,11 @@ MTensor msplat_render(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background
 ) {
-    MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
-        opacities, background, dummyGt, dummyWindow, 0.0f, false);
+        opacities, background);
     return g_tcache.out_img;
 }
 
