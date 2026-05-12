@@ -2553,6 +2553,101 @@ kernel void bitonic_sort_per_tile_kernel(
     }
 }
 
+// ===== 2DGS bitonic sort + pack (Phase 2b.3.1, step 4) =====
+// Same bitonic-sort scaffolding as bitonic_sort_per_tile_kernel — only the
+// fused pack step differs. Reads per-gaussian transMat (9 floats) and
+// normal_opacity (float4 with raw logit-space opacity in .w as written by
+// project_and_sh_forward_2dgs_kernel), applies sigmoid to opacity, and writes
+// the per-tile packed buffers consumed by nd_rasterize_forward_2dgs_kernel.
+//
+// Dead code until the host dispatcher's encode_prefix_map learns to call this
+// variant.
+kernel void bitonic_sort_per_tile_2dgs_kernel(
+    constant int* tile_offsets              [[buffer(0)]],
+    constant int* tile_counts_in            [[buffer(1)]],
+    constant uint64_t* prealloc_bins        [[buffer(2)]],
+    device int32_t* gaussian_ids_out        [[buffer(3)]],
+    constant uint& num_tiles                [[buffer(4)]],
+    // Pack inputs (per-gaussian).
+    constant float* xys                     [[buffer(5)]],   // float2
+    constant float* transMats               [[buffer(6)]],   // 9 floats
+    constant float* normal_opacity_in       [[buffer(7)]],   // float4: (n.xyz, raw opacity logit)
+    constant float* colors                  [[buffer(8)]],   // float3 (raw SH output)
+    // Pack outputs (per sorted-gaussian).
+    device float* packed_xy                 [[buffer(9)]],   // float2
+    device float* packed_transmat           [[buffer(10)]],  // 9 floats
+    device float* packed_normal_opac        [[buffer(11)]],  // float4 — .w is sigmoid(opac)
+    device float* packed_rgb                [[buffer(12)]],  // float3
+    device int* tile_bins                   [[buffer(13)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tg_id >= num_tiles) return;
+
+    int count_raw = tile_counts_in[tg_id];
+    int count = min(count_raw, MAX_TILE_ELEMS);
+    int end = tile_offsets[tg_id];
+    int start = end - count;
+
+    if (tid == 0) {
+        write_packed_int2(tile_bins, tg_id, int2(start, end));
+    }
+    if (count == 0) return;
+
+    int n = 1;
+    while (n < count) n <<= 1;
+
+    threadgroup uint64_t data[MAX_TILE_ELEMS];
+    uint64_t bin_base = (uint64_t)tg_id * MAX_TILE_ELEMS;
+    for (int i = (int)tid; i < n; i += SORT_TG_SIZE) {
+        data[i] = (i < count) ? prealloc_bins[bin_base + i] : 0xFFFFFFFFFFFFFFFFULL;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Bitonic sort (identical to 3DGS variant — uint64 keys with depth in upper bits).
+    for (int k = 2; k <= n; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = (int)tid; i < (n >> 1); i += SORT_TG_SIZE) {
+                int pos = 2 * i - (i & (j - 1));
+                int partner = pos ^ j;
+                bool ascending = ((pos & k) == 0);
+                uint64_t a = data[pos];
+                uint64_t b = data[partner];
+                if ((a > b) == ascending) {
+                    data[pos] = b;
+                    data[partner] = a;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // 2DGS pack: copy xy, T (9 floats), normal+sigmoid(opacity), RGB
+    for (int i = (int)tid; i < count; i += SORT_TG_SIZE) {
+        int32_t g_id = (int32_t)(data[i] & 0xFFFFFFFF);
+        int global_idx = start + i;
+        gaussian_ids_out[global_idx] = g_id;
+
+        // xy → float2
+        write_packed_float2(packed_xy, global_idx, read_packed_float2(xys, g_id));
+
+        // 9-float transmat — straight copy of the 3 rows
+        uint src = (uint)g_id * 9;
+        uint dst = (uint)global_idx * 9;
+        for (int kk = 0; kk < 9; kk++) {
+            packed_transmat[dst + kk] = transMats[src + kk];
+        }
+
+        // normal_opacity: read (n.xyz, raw_opac_logit), write (n.xyz, sigmoid(raw))
+        float4 no = read_packed_float4(normal_opacity_in, g_id);
+        float opac = 1.f / (1.f + exp(-no.w));
+        write_packed_float4(packed_normal_opac, global_idx, float4(no.x, no.y, no.z, opac));
+
+        // RGB straight copy (raw SH, matches 3DGS path)
+        write_packed_float3(packed_rgb, global_idx, read_packed_float3(colors, g_id));
+    }
+}
+
 // ===== Radix Sort Kernels (legacy, kept for reference) =====
 // 8-bit LSB radix sort for int64 keys + int32 values.
 // 3 kernels per pass: histogram, scan, scatter.
