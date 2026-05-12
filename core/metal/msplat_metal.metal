@@ -12,10 +12,9 @@ using namespace metal;
 #define MAX_REGISTER_CHANNELS 3
 
 // Scale-vector dim. 3 for 3DGS (axis-aligned ellipsoid), 2 for 2DGS (in-plane
-// disc). Kept in lockstep with core/include/model.hpp's constexpr int kScaleDim.
-// Phase 2b.3.2 (4/N) drops hardcoded `*3` indexing in the densify kernels so
-// step (5) can flip both sides to 2.
-constant int kScaleDim = 3;
+// disc). Kept in lockstep with core/include/model.hpp's constexpr int kScaleDim;
+// Phase 2b.3.2 (5/N) flipped both sides to 2 — codebase now commits to 2DGS.
+constant int kScaleDim = 2;
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
