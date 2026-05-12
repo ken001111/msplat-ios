@@ -908,6 +908,12 @@ MTensor msplat_render(
     return g_tcache.out_img;
 }
 
+// 2DGS side outputs from the most recent msplat_render. Both buffers live in
+// g_tcache and are written by nd_rasterize_forward_2dgs_kernel; under the
+// 3DGS dispatch path they're allocated but untouched.
+MTensor msplat_last_out_depth()  { return g_tcache.out_depth; }
+MTensor msplat_last_out_normal() { return g_tcache.out_normal; }
+
 std::tuple<MTensor, float> msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,

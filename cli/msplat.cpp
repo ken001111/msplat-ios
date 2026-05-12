@@ -107,6 +107,14 @@ int main(int argc, char *argv[]) {
     app.add_option("--dump-init-scales", dumpInitScales,
         "Dump initial scales tensor to <path> and exit (Phase 2b.2a validation)");
 
+    // Phase 2b.3.2 (6/N) smoke hook: load a PLY (3DGS or 2DGS) and render the
+    // first training camera with msplat_render, then exit. Reports min/max/mean
+    // and nonzero counts on out_img + the 2DGS side outputs (out_depth /
+    // out_normal). Run with MSPLAT_2DGS=1 to exercise the 2DGS forward path.
+    std::string renderOnly;
+    app.add_option("--render-only", renderOnly,
+        "Load <PLY>, render the first training camera, dump stats, then exit");
+
     CLI11_PARSE(app, argc, argv);
 
     if (validate || !valRender.empty()) validate = true;
@@ -151,6 +159,47 @@ int main(int argc, char *argv[]) {
             std::cout << "Dumped " << cpu.numel() << " floats ("
                       << cpu.nbytes() << " bytes) of initial scales to "
                       << dumpInitScales << std::endl;
+            return 0;
+        }
+
+        if (!renderOnly.empty()) {
+            if (cams.empty()) throw std::runtime_error("--render-only: no training cameras available");
+            std::cout << "Loading PLY: " << renderOnly << std::endl;
+            model.loadPly(renderOnly);
+            std::cout << "Loaded " << model.means.size(0) << " gaussians, scales shape ["
+                      << model.scales.size(0) << ", " << model.scales.size(1) << "]" << std::endl;
+
+            Camera &cam = cams[0];
+            std::cout << "Rendering camera: " << cam.filePath << "  ("
+                      << cam.width << "x" << cam.height << ")  fx=" << cam.fx << " fy=" << cam.fy << std::endl;
+
+            MTensor out_img = model.render(cam, 0);
+            msplat_gpu_sync();
+
+            auto report = [](const char *name, const MTensor &t) {
+                if (!t.defined()) { std::cout << "  " << name << ": <undefined>" << std::endl; return; }
+                const float *p = t.data<float>();
+                int64_t n = t.numel();
+                float mn = p[0], mx = p[0];
+                double sum = 0.0;
+                int64_t nz = 0;
+                for (int64_t i = 0; i < n; i++) {
+                    mn = std::min(mn, p[i]); mx = std::max(mx, p[i]); sum += p[i];
+                    if (p[i] != 0.0f) nz++;
+                }
+                std::cout << "  " << std::left << std::setw(11) << name << " shape=[";
+                for (size_t k = 0; k < t.shape().size(); k++) {
+                    std::cout << t.shape()[k] << (k + 1 < t.shape().size() ? ", " : "");
+                }
+                std::cout << "]  min=" << std::setw(11) << mn
+                          << "  max=" << std::setw(11) << mx
+                          << "  mean=" << std::setw(11) << (sum / std::max((int64_t)1, n))
+                          << "  nonzero=" << nz << "/" << n << std::endl;
+            };
+            std::cout << "Render done. Buffer stats:" << std::endl;
+            report("out_img",    out_img);
+            report("out_depth",  msplat_last_out_depth());
+            report("out_normal", msplat_last_out_normal());
             return 0;
         }
 

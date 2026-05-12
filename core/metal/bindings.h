@@ -32,6 +32,13 @@ void msplat_drain_gpu_times(std::vector<double>& out);
 void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages, int& n_stages,
                               const char** stage_names);
 
+// 2DGS forward side outputs from the most recent msplat_render call.
+// Populated when MSPLAT_2DGS=1 routes through nd_rasterize_forward_2dgs_kernel;
+// undefined / zero otherwise. Phase 2b.3.2 (6/N) smoke test reads these to
+// validate the dispatch path end-to-end.
+MTensor msplat_last_out_depth();    // (H, W) Float32 — alpha-weighted depth
+MTensor msplat_last_out_normal();   // (H, W, 3) Float32 — alpha-weighted world-space normal
+
 // Render-only forward pass (no loss computation)
 // Returns: out_img (H, W, 3) as MTensor
 MTensor msplat_render(
