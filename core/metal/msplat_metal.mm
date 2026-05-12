@@ -131,6 +131,10 @@ struct MetalContext {
     // Forward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
+    // Phase 2b.3.1 — 2DGS forward variants (loaded but not yet dispatched).
+    id<MTLComputePipelineState> project_and_sh_forward_2dgs_kernel_cpso;
+    id<MTLComputePipelineState> nd_rasterize_forward_2dgs_kernel_cpso;
+    id<MTLComputePipelineState> bitonic_sort_per_tile_2dgs_kernel_cpso;
     // Tile-local sorting
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
@@ -234,6 +238,13 @@ MetalContext* init_msplat_metal_context() {
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
+    // Phase 2b.3.1: 2DGS forward variants. Loaded eagerly so any kernel-creation
+    // error (signature mismatch, threadgroup-memory overflow, etc.) surfaces at
+    // startup rather than first 2DGS dispatch. Not used until the dispatcher
+    // wires them up in a later commit.
+    ctx->project_and_sh_forward_2dgs_kernel_cpso  = load(@"project_and_sh_forward_2dgs_kernel");
+    ctx->nd_rasterize_forward_2dgs_kernel_cpso    = load(@"nd_rasterize_forward_2dgs_kernel");
+    ctx->bitonic_sort_per_tile_2dgs_kernel_cpso   = load(@"bitonic_sort_per_tile_2dgs_kernel");
     // Tile-local sorting
     ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
