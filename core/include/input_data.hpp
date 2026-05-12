@@ -64,4 +64,15 @@ InputData inputDataFromX(const std::string &path, const std::string &colmapImage
 // frame, so extent ≈ 1.3 covers a scene normalized to camera-radius ≈ 1.
 void initializeRandomPoints(InputData &data, int64_t numPoints = 100000, float extent = 1.3f);
 
+// Apply per-frame foreground masks to already-loaded camera images, matching
+// the LiDAR-mask step in Facescan's Colab notebook. Background pixels (mask <
+// 0.5) become white. `dilationPx` is the radius (kernel = 2*r+1) of a max-
+// filter dilation applied to the kept region — needed because LiDAR depth is
+// 256x192 while RGB is 1280x720, so the binary mask boundary lands ~5 RGB
+// pixels off the true silhouette. Caller must have already invoked
+// `cam.loadImage()` on each camera. Cameras whose mask file is missing are
+// left untouched. Mask files are looked up by image stem: an image named
+// `frame_00001.jpg` pairs with `masksDir/frame_00001.png`.
+void applyDepthMasks(InputData &data, const std::string &masksDir, int dilationPx = 8);
+
 #endif

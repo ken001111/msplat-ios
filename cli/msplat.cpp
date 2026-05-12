@@ -92,6 +92,14 @@ int main(int argc, char *argv[]) {
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
 
+    // Facescan / Colab parity: per-frame foreground masks.
+    std::string masksDir;
+    app.add_option("--masks-dir", masksDir,
+        "Directory of per-frame foreground masks (PNG, white=foreground)");
+    int maskDilation = 8;
+    app.add_option("--mask-dilation", maskDilation,
+        "Dilate the foreground region by N pixels (matches PIL MaxFilter(2*r+1))");
+
     CLI11_PARSE(app, argc, argv);
 
     if (validate || !valRender.empty()) validate = true;
@@ -103,6 +111,10 @@ int main(int argc, char *argv[]) {
 
         for (auto &cam : inputData.cameras)
             cam.loadImage(downScaleFactor);
+
+        if (!masksDir.empty()) {
+            applyDepthMasks(inputData, masksDir, maskDilation);
+        }
 
         std::vector<Camera> cams;
         std::vector<Camera> testCams;
