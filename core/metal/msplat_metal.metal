@@ -609,7 +609,16 @@ kernel void nd_rasterize_forward_2dgs_kernel(
     float median_depth = 0.f;
     int median_contributor = -1;
 
-    int last_contributor = range.x - 1;
+    // Counter semantics: `contributor` is a 1-based per-pixel iter counter
+    // that increments at the TOP of each surfel iteration (matches reference
+    // forward.cu line 303-347). `last_contributor` records the value of
+    // `contributor` after the most-recent successful blend. `median_contributor`
+    // is set during the T>0.5 blend. These semantics are what the backward's
+    // `if (contributor >= last_contributor) continue;` check expects (reference
+    // backward.cu line 199-278). Earlier this code stored sorted-list-absolute
+    // indices, which silently corrupted gradient propagation.
+    int contributor = 0;
+    int last_contributor = 0;
     bool done = false;
 
     for (int b = 0; b < num_batches; ++b) {
@@ -636,6 +645,10 @@ kernel void nd_rasterize_forward_2dgs_kernel(
         int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
 
         for (int t = 0; t < batch_size; ++t) {
+            // 1-based per-pixel iter counter increments BEFORE any skip — matches
+            // reference forward.cu line 347.
+            contributor++;
+
             // Build two homogeneous planes from T's rows. (forward.cu Eq. 8)
             const float3 Tu = Tu_batch[t];
             const float3 Tv = Tv_batch[t];
@@ -671,7 +684,9 @@ kernel void nd_rasterize_forward_2dgs_kernel(
 
             const float next_T = T * (1.0f - alpha);
             if (next_T <= 1e-4f) {
-                last_contributor = batch_start + t - 1;
+                // Early-exit surfel did NOT blend → don't update last_contributor.
+                // (Reference forward.cu line 390-394 does `done=true; continue;`,
+                // which leaves contributor incremented but last_contributor unchanged.)
                 done = true;
                 break;
             }
@@ -690,7 +705,7 @@ kernel void nd_rasterize_forward_2dgs_kernel(
             // Median: capture the first surfel that pushes T below 0.5.
             if (T > 0.5f) {
                 median_depth = depth;
-                median_contributor = batch_start + t;
+                median_contributor = contributor;
             }
 
             // RGB accumulation
@@ -701,7 +716,7 @@ kernel void nd_rasterize_forward_2dgs_kernel(
             pix_normal = fma(float3(nor_o.x, nor_o.y, nor_o.z), w, pix_normal);
 
             T = next_T;
-            last_contributor = batch_start + t;
+            last_contributor = contributor;
         }
     }
 
@@ -714,9 +729,11 @@ kernel void nd_rasterize_forward_2dgs_kernel(
         final_index[2 * pix_id + 0] = last_contributor;
         final_index[2 * pix_id + 1] = median_contributor;
 
-        // Color: composite with background, saturate to [0, 1].
+        // Color: composite with background, NO saturate — reference forward.cu
+        // line 434 doesn't clamp, and clamping requires masking dL_dpixel in
+        // the backward for the clipped channels. Match the reference exactly.
         float3 bg = float3(background[0], background[1], background[2]);
-        float3 final_rgb = saturate(fma(bg, T, pix_color));
+        float3 final_rgb = fma(bg, T, pix_color);
         out_img[CHANNELS * pix_id + 0] = final_rgb.x;
         out_img[CHANNELS * pix_id + 1] = final_rgb.y;
         out_img[CHANNELS * pix_id + 2] = final_rgb.z;
@@ -895,6 +912,117 @@ void sh_coeffs_to_color_vjp(
 }
 
 
+
+// Compute dL/d(viewdir) from SH coefficients + dL/dRGB. Mirrors reference
+// backward.cu computeColorFromSH lines 36-125 (the dRGBdx/dRGBdy/dRGBdz
+// accumulation) but reads our packed-features layout: features_dc[i*3+c] for
+// the DC term, features_rest[(k-1)*CHANNELS+c] for basis k = 1..total-1.
+// The viewdir gradient is needed because color depends on the normalized
+// direction from p_orig to cam_pos, and that direction depends on p_orig —
+// without this term, mean3D never gets the "view-dependent color says I
+// should move there" signal and trained gaussians converge to wrong 3D
+// positions (low photometric loss but unrecognizable mesh).
+inline float3 sh_color_dL_ddir(
+    const uint degree,
+    const float3 viewdir,
+    constant float *features_rest,    // [frBases, CHANNELS] = (k - 1) * 3 + c
+    constant float *v_colors          // dL/dRGB (length CHANNELS)
+) {
+    if (degree < 1) return float3(0);
+
+    const float x = viewdir.x, y = viewdir.y, z = viewdir.z;
+
+    // Per-channel dRGBdx/dRGBdy/dRGBdz, length CHANNELS.
+    float dRGBdx[CHANNELS] = {0};
+    float dRGBdy[CHANNELS] = {0};
+    float dRGBdz[CHANNELS] = {0};
+
+    // Degree-1 contributions: basis k=1..3, features_rest indices 0..2.
+    // sh[1] = -SH_C1*y → dRGBdy contribution = -SH_C1 * sh[1] (= features_rest[0])
+    // sh[2] =  SH_C1*z → dRGBdz contribution =  SH_C1 * sh[2] (= features_rest[1])
+    // sh[3] = -SH_C1*x → dRGBdx contribution = -SH_C1 * sh[3] (= features_rest[2])
+    #pragma unroll
+    for (int c = 0; c < CHANNELS; ++c) {
+        dRGBdx[c] = -SH_C1 * features_rest[2 * CHANNELS + c];
+        dRGBdy[c] = -SH_C1 * features_rest[0 * CHANNELS + c];
+        dRGBdz[c] =  SH_C1 * features_rest[1 * CHANNELS + c];
+    }
+
+    if (degree >= 2) {
+        const float xx = x*x, yy = y*y, zz = z*z;
+        #pragma unroll
+        for (int c = 0; c < CHANNELS; ++c) {
+            const float s4 = features_rest[3 * CHANNELS + c];
+            const float s5 = features_rest[4 * CHANNELS + c];
+            const float s6 = features_rest[5 * CHANNELS + c];
+            const float s7 = features_rest[6 * CHANNELS + c];
+            const float s8 = features_rest[7 * CHANNELS + c];
+            dRGBdx[c] += SH_C2[0]*y*s4 + SH_C2[2]*(-2.f*x)*s6 + SH_C2[3]*z*s7 + SH_C2[4]*(2.f*x)*s8;
+            dRGBdy[c] += SH_C2[0]*x*s4 + SH_C2[1]*z*s5 + SH_C2[2]*(-2.f*y)*s6 + SH_C2[4]*(-2.f*y)*s8;
+            dRGBdz[c] += SH_C2[1]*y*s5 + SH_C2[2]*(4.f*z)*s6 + SH_C2[3]*x*s7;
+        }
+
+        if (degree >= 3) {
+            #pragma unroll
+            for (int c = 0; c < CHANNELS; ++c) {
+                const float s9  = features_rest[8 * CHANNELS + c];
+                const float s10 = features_rest[9 * CHANNELS + c];
+                const float s11 = features_rest[10 * CHANNELS + c];
+                const float s12 = features_rest[11 * CHANNELS + c];
+                const float s13 = features_rest[12 * CHANNELS + c];
+                const float s14 = features_rest[13 * CHANNELS + c];
+                const float s15 = features_rest[14 * CHANNELS + c];
+
+                dRGBdx[c] +=
+                    SH_C3[0] * s9  * (6.f * x * y) +
+                    SH_C3[1] * s10 * (y * z) +
+                    SH_C3[2] * s11 * (-2.f * x * y) +
+                    SH_C3[3] * s12 * (-6.f * x * z) +
+                    SH_C3[4] * s13 * (-3.f * xx + 4.f * zz - yy) +
+                    SH_C3[5] * s14 * (2.f * x * z) +
+                    SH_C3[6] * s15 * (3.f * (xx - yy));
+
+                dRGBdy[c] +=
+                    SH_C3[0] * s9  * (3.f * (xx - yy)) +
+                    SH_C3[1] * s10 * (x * z) +
+                    SH_C3[2] * s11 * (-3.f * yy + 4.f * zz - xx) +
+                    SH_C3[3] * s12 * (-6.f * y * z) +
+                    SH_C3[4] * s13 * (-2.f * x * y) +
+                    SH_C3[5] * s14 * (-2.f * y * z) +
+                    SH_C3[6] * s15 * (-6.f * x * y);
+
+                dRGBdz[c] +=
+                    SH_C3[1] * s10 * (x * y) +
+                    SH_C3[2] * s11 * (8.f * y * z) +
+                    SH_C3[3] * s12 * (3.f * (2.f * zz - xx - yy)) +
+                    SH_C3[4] * s13 * (8.f * x * z) +
+                    SH_C3[5] * s14 * (xx - yy);
+            }
+        }
+    }
+
+    // Project per-channel partials onto v_colors → dL/d(viewdir).
+    float3 dL_ddir = float3(0);
+    #pragma unroll
+    for (int c = 0; c < CHANNELS; ++c) {
+        dL_ddir.x += dRGBdx[c] * v_colors[c];
+        dL_ddir.y += dRGBdy[c] * v_colors[c];
+        dL_ddir.z += dRGBdz[c] * v_colors[c];
+    }
+    return dL_ddir;
+}
+
+// Back-prop dL/d(viewdir) through viewdir = normalize(v) where v = p_orig - cam_pos.
+// Returns dL/dv. Matches reference auxiliary.h:dnormvdv (float3 variant).
+inline float3 dnormvdv(float3 v, float3 dv) {
+    float sum2 = v.x*v.x + v.y*v.y + v.z*v.z;
+    float invsum32 = 1.0f / sqrt(sum2 * sum2 * sum2);
+    return float3(
+        ((sum2 - v.x*v.x) * dv.x - v.y * v.x * dv.y - v.z * v.x * dv.z) * invsum32,
+        (-v.x * v.y * dv.x + (sum2 - v.y*v.y) * dv.y - v.z * v.y * dv.z) * invsum32,
+        (-v.x * v.z * dv.x - v.y * v.z * dv.y + (sum2 - v.z*v.z) * dv.z) * invsum32
+    );
+}
 
 // Build (tile_id, depth) pairs for each gaussian-tile intersection.
 
@@ -1837,8 +1965,15 @@ kernel void nd_rasterize_backward_2dgs_kernel(
                 atomic_fetch_add_explicit(&dL_dtransMat[9*global_id+8], dL_dz, memory_order_relaxed);
             }
 
-            // Opacity gradient.
-            atomic_fetch_add_explicit(&dL_dopacity[global_id], G * dL_dalpha, memory_order_relaxed);
+            // Opacity gradient. The forward applies sigmoid to the raw logit
+            // when packing (line 1573 above), so the rasterizer sees
+            // opa = sigmoid(raw). To produce dL/d(raw) — the gradient Adam
+            // applies to `opacities` — we compose the sigmoid derivative
+            // d(sigmoid(raw))/d(raw) = opa * (1 - opa). Without this, opacity
+            // gradients are wrong-magnitude (and effectively zero near
+            // saturation), so splats with opacity≈0 or ≈1 cannot adjust.
+            const float dsig = opa * (1.0f - opa);
+            atomic_fetch_add_explicit(&dL_dopacity[global_id], G * dL_dalpha * dsig, memory_order_relaxed);
         }
     }
 }
@@ -1884,6 +2019,10 @@ kernel void project_and_sh_backward_2dgs_kernel(
     constant uint& degree,
     constant uint& degrees_to_use,
     constant float3& cam_pos,
+    // SH coefficient buffers (needed for dL/d(viewdir) → dL/d(mean3D) chain;
+    // reference computeColorFromSH backward at backward.cu lines 36-138).
+    constant float* features_rest,      // [N, frBases, 3] — non-DC SH bases
+    constant uint& num_bases_total,     // = num_sh_bases(degree)
     // Outputs
     device float* dL_dmean3D,           // [N, 3]
     device float* dL_dscale,            // [N, 2]
@@ -1891,6 +2030,14 @@ kernel void project_and_sh_backward_2dgs_kernel(
     device float* dL_dmean2D,           // [N, 2]  (OVERWRITE for densify hack)
     device float* dL_dfeatures_dc,      // [N, 3]
     device float* dL_dfeatures_rest,    // [N, frBases, 3]
+    // Densify gradient-stat accumulators (read-modify-write; reset by host every
+    // refineEvery iters after densify runs). Without these populated, densify
+    // sees zeros and never splits / dups → splat count stays at random-init
+    // count and training plateaus. Bug discovered during dummyhead 30k smoke.
+    device float* xys_grad_norm,        // [N]   — Σ |dL/dmean2D| (densify hack version)
+    device float* vis_counts,           // [N]   — count of iters this gaussian was visible
+    device float* max_2d_size,          // [N]   — max screen-space radius (in normalized units)
+    constant float& inv_max_dim,        // 1 / max(W, H) so radii are scale-invariant
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -2020,7 +2167,8 @@ kernel void project_and_sh_backward_2dgs_kernel(
     // SH chain rule. viewdir = normalize(p_world - cam_pos). dL_dcolors is the
     // gradient on raw SH eval (already masked by the +0.5/max clamp in the
     // rasterize backward).
-    float3 viewdir = normalize(p_orig - cam_pos);
+    float3 dir_unnorm = p_orig - cam_pos;
+    float3 viewdir = normalize(dir_unnorm);
     uint num_bases = num_sh_bases(degree);
     uint dc_idx = 3 * idx;
     uint rest_idx = idx * (num_bases - 1) * 3;
@@ -2030,14 +2178,34 @@ kernel void project_and_sh_backward_2dgs_kernel(
         &dL_dfeatures_dc[dc_idx],
         &dL_dfeatures_rest[rest_idx]);
 
-    // Densify hack: overwrite dL_dmean2D with the NDC-space contribution from
-    // the depth row of T (T_row2). In our row-major layout T_row2[col] sits at
-    // transMat[idx*9 + 6 + col]; the reference's column-major glm indexing
-    // reads idx*9 + 2 / +5 / +8 instead. The "depth" multiplier is the
-    // forward T_row2[2] (= p_clip.w in our construction).
-    float depth_fwd = p_clip.w;
-    dL_dmean2D[2*idx+0] = dL_dtransMat[base + 6] * depth_fwd * 0.5f * W;
-    dL_dmean2D[2*idx+1] = dL_dtransMat[base + 7] * depth_fwd * 0.5f * H;
+    // Bug 2 fix: dL/d(viewdir) → dL/d(p_orig). For SH degree ≥ 1, color depends
+    // on viewdir = normalize(p_orig - cam_pos). The reference accounts for this
+    // (backward.cu lines 127-138); without it, mean3D gets a biased gradient
+    // and trained gaussians don't converge to the correct 3D positions even
+    // though the photometric loss matches.
+    if (degrees_to_use >= 1) {
+        float3 dL_ddir = sh_color_dL_ddir(
+            degrees_to_use, viewdir,
+            &features_rest[rest_idx],
+            &dL_dcolors[3 * idx]);
+        float3 dL_dp_orig_from_dir = dnormvdv(dir_unnorm, dL_ddir);
+        dL_dmean3D[3*idx+0] += dL_dp_orig_from_dir.x;
+        dL_dmean3D[3*idx+1] += dL_dp_orig_from_dir.y;
+        dL_dmean3D[3*idx+2] += dL_dp_orig_from_dir.z;
+    }
+
+    // Densify proxy. Reference (column-major) uses slots 2 and 5 = col_u.z, col_v.z.
+    // In our row-major storage those parameters live at slots 6 and 7 (= T_row2.x,
+    // T_row2.y = dL/d(col_u.z), dL/d(col_v.z)).
+    float depth_fwd = p_clip.w;  // = col_o.z
+    float dmx = dL_dtransMat[base + 6] * depth_fwd * 0.5f * W;
+    float dmy = dL_dtransMat[base + 7] * depth_fwd * 0.5f * H;
+    dL_dmean2D[2*idx+0] = dmx;
+    dL_dmean2D[2*idx+1] = dmy;
+    xys_grad_norm[idx] += fabs(dmx) + fabs(dmy);
+    vis_counts[idx]    += 1.0f;
+    float r_norm = float(radii[idx]) * inv_max_dim;
+    if (r_norm > max_2d_size[idx]) max_2d_size[idx] = r_norm;
 }
 
 // ===== TSDF fusion (Phase 2c.2) =====
@@ -2090,7 +2258,10 @@ kernel void tsdf_integrate_kernel(
     int pid = iy * (int)imgSize.x + ix;
     float a = alphaMap[pid];
     if (a < alphaThresh) return;
-    float depth = depthMap[pid] / a;   // alpha-divide → mean depth
+    // depthMap is expected to be already-normalized (the model side either
+    // passes median depth — surface depth at T=0.5 — or pre-divides expected
+    // depth by alpha). Don't divide again here.
+    float depth = depthMap[pid];
     if (!isfinite(depth) || depth <= 0.0f) return;
 
     // SDF in meters. Positive if voxel is between camera and surface.
@@ -2535,10 +2706,12 @@ kernel void loss_l1_distortion_2dgs_kernel(
     constant float& inv_num_pixels,        // 1 / (H * W * 3) for L1 normalization
     constant float& lambda_l1,             // typically 0.8 (1 - ssim_weight)
     constant float& lambda_dist,           // depth distortion regularizer weight
+    constant float& lambda_dssim,          // DSSIM weight (ssim_weight, e.g. 0.2)
     // Forward outputs (read).
     constant float* out_img,               // float3 per pixel — already +bg composited
     constant float* gt,                    // float3 per pixel
     constant float* out_distortion,        // float per pixel — needed for the regularizer loss value
+    constant float* ssim_sum,              // [1] scalar — sum of ssim_map over (H*W*3), produced by ssim_compute_kernel
     // Gradient outputs (write — host blits to zero before this dispatch).
     device float* dL_dout_img,             // float3 per pixel
     device float* dL_dout_distortion,      // float per pixel
@@ -2573,7 +2746,342 @@ kernel void loss_l1_distortion_2dgs_kernel(
     local_loss += lambda_dist * dist * inv_HW;
     dL_dout_distortion[pix_id] = lambda_dist * inv_HW;
 
+    // DSSIM loss value: lambda_dssim * (1 - mean(ssim_map)).
+    // ssim_sum is the sum over all H*W*3 entries; inv_num_pixels = 1/(H*W*3),
+    // so mean(ssim_map) = ssim_sum[0] * inv_num_pixels. The full (1 - mean)
+    // term must only be added once — pixel (0,0) carries the whole scalar so
+    // we don't multi-count across threads. The DSSIM gradient on dL_dout_img
+    // is applied by the separate ssim_backward kernels (this kernel only
+    // writes L1's contribution; SSIM kernels add to it atomically).
+    if (pix.x == 0u && pix.y == 0u) {
+        float ssim_mean = ssim_sum[0] * inv_num_pixels;
+        local_loss += lambda_dssim * (1.0f - ssim_mean);
+    }
+
     atomic_fetch_add_explicit(loss_sum, local_loss, memory_order_relaxed);
+}
+
+// ===== DSSIM (Differentiable SSIM) — Colab parity for 2DGS training =====
+// L1 alone lets the optimizer find streaky surfels aligned with view rays —
+// pixels match but geometry is wrong. SSIM penalizes structural mismatch
+// over an 11×11 Gaussian window, forcing locally-correct neighborhoods.
+//
+// Reference: hbb1/2d-gaussian-splatting utils/loss_utils.py.
+// loss = (1 - lambda_dssim) * L1 + lambda_dssim * (1 - mean(SSIM)).
+// Default lambda_dssim = 0.2. C1 = 0.01², C2 = 0.03².
+//
+// The 2D Gaussian filter is implemented as a separable 1D pair: horizontal
+// blur then vertical blur. This matches PyTorch's F.conv2d with padding=5,
+// which uses zero padding for out-of-bounds reads.
+//
+// Forward dispatch sequence (called from msplat_train_step_2dgs):
+//   1. ssim_prep_products_kernel:  build (img1*img1, img2*img2, img1*img2)
+//      packed into one 9-channel tmp.
+//   2. ssim_blur_horiz_kernel ×5:  horizontal blur of {img1, img2, img1²,
+//      img2², img1*img2}.
+//   3. ssim_blur_vert_kernel ×5:   vertical blur of the same five sources.
+//   4. ssim_compute_kernel:        per-pixel-per-channel SSIM, atomic-sum.
+//
+// Backward dispatch sequence:
+//   5. ssim_backward_compute_kernel: per-pixel gradients of SSIM w.r.t. its
+//      five blurred inputs (writes grad_mu1, grad_mu2, grad_sigma1_sq,
+//      grad_sigma2_sq, grad_sigma12; also folds the sigma-path corrections
+//      back into grad_mu1 and grad_mu2).
+//   6. ssim_blur_vert_kernel ×3 + ssim_blur_horiz_kernel ×3: re-blur the
+//      grad_{mu1, sigma1_sq, sigma12} buffers (Gaussian is symmetric, so the
+//      adjoint convolution is the same kernel).
+//   7. ssim_backward_accumulate_kernel: combines the three blurred-grad
+//      paths plus the (img1, img2) factors and atomically adds to
+//      dL_dout_img (which already holds the L1 contribution).
+
+constant int SSIM_WINDOW_SIZE = 11;
+constant int SSIM_WINDOW_RADIUS = 5;  // (WINDOW_SIZE - 1) / 2
+
+// 11-element 1D Gaussian kernel, sigma = 1.5, normalized so sum = 1.
+// Matches PyTorch reference: `gauss = exp(-(x-5)² / (2·1.5²))`, then
+// `gauss /= gauss.sum()` (utils/loss_utils.py). Unnormalized sum ≈ 3.7592328;
+// normalized weights below sum to 1.0 within float32 round-off.
+constant float SSIM_GAUSS_KERNEL[11] = {
+    0.001028380084f,
+    0.007598758135f,
+    0.036000772128f,
+    0.109360689510f,
+    0.213005537711f,
+    0.266011724862f,
+    0.213005537711f,
+    0.109360689510f,
+    0.036000772128f,
+    0.007598758135f,
+    0.001028380084f
+};
+
+// Pack [img1, img2, img1*img1, img2*img2, img1*img2] per-pixel-per-channel into
+// a single 15-channel tmp buffer? Cleaner: keep them as 5 separate [H,W,3]
+// buffers — only img1*img1, img2*img2, img1*img2 are computed; img1 and img2
+// are read directly from out_img and gt. This kernel writes only the product
+// tensors.
+kernel void ssim_prep_products_kernel(
+    constant uint2& img_size,
+    constant float* img1,        // out_img, [H, W, 3]
+    constant float* img2,        // gt,      [H, W, 3]
+    device   float* img1_sq,     // [H, W, 3]
+    device   float* img2_sq,     // [H, W, 3]
+    device   float* img1_img2,   // [H, W, 3]
+    uint2 pix [[thread_position_in_grid]]
+) {
+    uint W = img_size.x;
+    uint H = img_size.y;
+    if (pix.x >= W || pix.y >= H) return;
+    uint base = (pix.y * W + pix.x) * 3u;
+    for (uint c = 0u; c < 3u; ++c) {
+        float a = img1[base + c];
+        float b = img2[base + c];
+        img1_sq  [base + c] = a * a;
+        img2_sq  [base + c] = b * b;
+        img1_img2[base + c] = a * b;
+    }
+}
+
+// Separable Gaussian — horizontal pass. Output is the same shape as input.
+// Zero-padding outside [0, W) to match PyTorch F.conv2d(padding=5).
+kernel void ssim_blur_horiz_kernel(
+    constant uint2& img_size,
+    constant float* in_img,      // [H, W, 3]
+    device   float* out_img,     // [H, W, 3]
+    uint2 pix [[thread_position_in_grid]]
+) {
+    uint W = img_size.x;
+    uint H = img_size.y;
+    if (pix.x >= W || pix.y >= H) return;
+    int x = (int)pix.x;
+    int y = (int)pix.y;
+
+    float acc[3] = {0.0f, 0.0f, 0.0f};
+    for (int k = -SSIM_WINDOW_RADIUS; k <= SSIM_WINDOW_RADIUS; ++k) {
+        int xs = x + k;
+        if (xs < 0 || xs >= (int)W) continue;   // zero-pad outside
+        float w = SSIM_GAUSS_KERNEL[k + SSIM_WINDOW_RADIUS];
+        uint base = ((uint)y * W + (uint)xs) * 3u;
+        acc[0] += w * in_img[base + 0];
+        acc[1] += w * in_img[base + 1];
+        acc[2] += w * in_img[base + 2];
+    }
+    uint out_base = ((uint)y * W + (uint)x) * 3u;
+    out_img[out_base + 0] = acc[0];
+    out_img[out_base + 1] = acc[1];
+    out_img[out_base + 2] = acc[2];
+}
+
+// Separable Gaussian — vertical pass. Output is the same shape as input.
+// Zero-padding outside [0, H) to match PyTorch F.conv2d(padding=5).
+kernel void ssim_blur_vert_kernel(
+    constant uint2& img_size,
+    constant float* in_img,      // [H, W, 3]
+    device   float* out_img,     // [H, W, 3]
+    uint2 pix [[thread_position_in_grid]]
+) {
+    uint W = img_size.x;
+    uint H = img_size.y;
+    if (pix.x >= W || pix.y >= H) return;
+    int x = (int)pix.x;
+    int y = (int)pix.y;
+
+    float acc[3] = {0.0f, 0.0f, 0.0f};
+    for (int k = -SSIM_WINDOW_RADIUS; k <= SSIM_WINDOW_RADIUS; ++k) {
+        int ys = y + k;
+        if (ys < 0 || ys >= (int)H) continue;   // zero-pad outside
+        float w = SSIM_GAUSS_KERNEL[k + SSIM_WINDOW_RADIUS];
+        uint base = ((uint)ys * W + (uint)x) * 3u;
+        acc[0] += w * in_img[base + 0];
+        acc[1] += w * in_img[base + 1];
+        acc[2] += w * in_img[base + 2];
+    }
+    uint out_base = ((uint)y * W + (uint)x) * 3u;
+    out_img[out_base + 0] = acc[0];
+    out_img[out_base + 1] = acc[1];
+    out_img[out_base + 2] = acc[2];
+}
+
+// Per-pixel-per-channel SSIM map computation. Reads the five blurred buffers
+// (mu1, mu2, blur(img1²), blur(img2²), blur(img1*img2)), computes
+// sigma1_sq / sigma2_sq / sigma12 inline, and emits ssim_map[H,W,3].
+// Also atomic-sums all (H*W*3) entries into ssim_sum[0] so the loss kernel
+// can read a single scalar.
+kernel void ssim_compute_kernel(
+    constant uint2& img_size,
+    constant float* mu1,             // blur(img1)        — [H, W, 3]
+    constant float* mu2,             // blur(img2)        — [H, W, 3]
+    constant float* blur_img1_sq,    // blur(img1*img1)   — [H, W, 3]
+    constant float* blur_img2_sq,    // blur(img2*img2)   — [H, W, 3]
+    constant float* blur_img1_img2,  // blur(img1*img2)   — [H, W, 3]
+    device   float* ssim_map,        // [H, W, 3] — cached for backward
+    device atomic<float>* ssim_sum,  // [1] scalar — sum over all entries
+    uint2 pix [[thread_position_in_grid]]
+) {
+    uint W = img_size.x;
+    uint H = img_size.y;
+    if (pix.x >= W || pix.y >= H) return;
+    uint base = (pix.y * W + pix.x) * 3u;
+
+    const float C1 = 0.0001f;   // (0.01)²
+    const float C2 = 0.0009f;   // (0.03)²
+
+    float local_sum = 0.0f;
+    for (uint c = 0u; c < 3u; ++c) {
+        float m1 = mu1[base + c];
+        float m2 = mu2[base + c];
+        float m1_sq = m1 * m1;
+        float m2_sq = m2 * m2;
+        float m1m2  = m1 * m2;
+
+        // sigma_sq = blur(img²) - mu²;  sigma12 = blur(img1*img2) - mu1*mu2.
+        float s1_sq = blur_img1_sq  [base + c] - m1_sq;
+        float s2_sq = blur_img2_sq  [base + c] - m2_sq;
+        float s12   = blur_img1_img2[base + c] - m1m2;
+
+        float A = 2.0f * m1m2 + C1;
+        float B = 2.0f * s12  + C2;
+        float Cd = m1_sq + m2_sq + C1;
+        float Dd = s1_sq + s2_sq + C2;
+
+        float val = (A * B) / (Cd * Dd);
+        ssim_map[base + c] = val;
+        local_sum += val;
+    }
+    atomic_fetch_add_explicit(ssim_sum, local_sum, memory_order_relaxed);
+}
+
+// Per-pixel backward of SSIM, computed analytically. Reads the cached forward
+// blurred buffers and writes the five blurred-input gradients. dL/dssim_map
+// is uniform across all pixels and channels: -lambda_dssim * inv_num_pixels.
+//
+// We bake dL/dssim_map into each output gradient so the downstream re-blur
+// passes don't need to multiply.
+//
+// The grad-mu paths each get TWO contributions: the direct A/C derivative,
+// PLUS the sigma-path correction (sigma_sq = ... - mu²; sigma12 = ... - mu1*mu2).
+// Both contributions are folded here so the downstream blur kernels see a
+// single grad_mu1 / grad_mu2 buffer each.
+kernel void ssim_backward_compute_kernel(
+    constant uint2& img_size,
+    constant float& dL_dssim_uniform,  // = -lambda_dssim * inv_num_pixels (scalar)
+    constant float* mu1,
+    constant float* mu2,
+    constant float* blur_img1_sq,
+    constant float* blur_img2_sq,
+    constant float* blur_img1_img2,
+    device   float* grad_mu1,          // [H, W, 3]
+    device   float* grad_mu2,          // [H, W, 3]
+    device   float* grad_sigma1_sq,    // [H, W, 3]
+    device   float* grad_sigma2_sq,    // [H, W, 3]
+    device   float* grad_sigma12,      // [H, W, 3]
+    uint2 pix [[thread_position_in_grid]]
+) {
+    uint W = img_size.x;
+    uint H = img_size.y;
+    if (pix.x >= W || pix.y >= H) return;
+    uint base = (pix.y * W + pix.x) * 3u;
+
+    const float C1 = 0.0001f;
+    const float C2 = 0.0009f;
+    float g = dL_dssim_uniform;   // == dL/d(ssim_map[i,j,c])
+
+    for (uint c = 0u; c < 3u; ++c) {
+        float m1 = mu1[base + c];
+        float m2 = mu2[base + c];
+        float m1_sq = m1 * m1;
+        float m2_sq = m2 * m2;
+        float m1m2  = m1 * m2;
+
+        float s1_sq = blur_img1_sq  [base + c] - m1_sq;
+        float s2_sq = blur_img2_sq  [base + c] - m2_sq;
+        float s12   = blur_img1_img2[base + c] - m1m2;
+
+        float A = 2.0f * m1m2 + C1;
+        float B = 2.0f * s12  + C2;
+        float Cd = m1_sq + m2_sq + C1;
+        float Dd = s1_sq + s2_sq + C2;
+
+        float CD = Cd * Dd;
+        float AB = A * B;
+
+        // SSIM = AB / CD.
+        // d(SSIM)/dmu1 = (2*m2*B*CD - AB*2*m1*Dd) / (CD)²
+        //              = 2/(CD) * (m2*B - m1*A*B/Cd)
+        // d(SSIM)/dmu2 = 2/(CD) * (m1*B - m2*A*B/Cd)
+        // d(SSIM)/d(sigma12)   = 2A / (CD)
+        // d(SSIM)/d(sigma1_sq) = -AB / (Cd*Dd²) = -AB / (CD*Dd)
+        // d(SSIM)/d(sigma2_sq) = -AB / (CD*Dd)
+        float inv_CD  = 1.0f / CD;
+        float inv_Cd  = 1.0f / Cd;
+        float inv_Dd  = 1.0f / Dd;
+
+        float dssim_dmu1 = 2.0f * inv_CD * (m2 * B - m1 * AB * inv_Cd);
+        float dssim_dmu2 = 2.0f * inv_CD * (m1 * B - m2 * AB * inv_Cd);
+        float dssim_ds12   =  2.0f * A * inv_CD;
+        float dssim_ds1_sq = -AB * inv_CD * inv_Dd;
+        float dssim_ds2_sq = -AB * inv_CD * inv_Dd;
+
+        // Multiply each by upstream dL/dssim_map = g (uniform).
+        float gmu1   = g * dssim_dmu1;
+        float gmu2   = g * dssim_dmu2;
+        float gs12   = g * dssim_ds12;
+        float gs1_sq = g * dssim_ds1_sq;
+        float gs2_sq = g * dssim_ds2_sq;
+
+        // Sigma-path correction: sigma1_sq depends on mu1 as -mu1²
+        // (chain rule: d(sigma1_sq)/dmu1 = -2*m1), and sigma12 depends on
+        // mu1 as -mu1*mu2. Fold these into grad_mu1/grad_mu2 so the blur
+        // backward only needs to chain over grad_mu* once.
+        gmu1 += gs1_sq * (-2.0f * m1);
+        gmu1 += gs12   * (-m2);
+        gmu2 += gs2_sq * (-2.0f * m2);
+        gmu2 += gs12   * (-m1);
+
+        grad_mu1      [base + c] = gmu1;
+        grad_mu2      [base + c] = gmu2;
+        grad_sigma1_sq[base + c] = gs1_sq;
+        grad_sigma2_sq[base + c] = gs2_sq;
+        grad_sigma12  [base + c] = gs12;
+    }
+}
+
+// After the three relevant grad_{mu1, sigma1_sq, sigma12} buffers have been
+// re-blurred (separable transpose conv = same kernel since Gaussian is
+// symmetric), accumulate them into dL_dout_img with the per-pixel chain-rule
+// factors:
+//   dL/dimg1 += blurred_grad_mu1                  (path: img1 → blur → mu1)
+//   dL/dimg1 += 2 * img1 * blurred_grad_sigma1_sq (path: img1 → img1² → blur)
+//   dL/dimg1 +=     img2 * blurred_grad_sigma12   (path: img1 → img1*img2 → blur)
+// Existing dL_dout_img already contains the L1 gradient — we ADD here, not
+// overwrite. We don't bother with atomic-add because each pixel is written
+// by exactly one thread (no overlap).
+kernel void ssim_backward_accumulate_kernel(
+    constant uint2& img_size,
+    constant float* img1,                  // out_img  — [H, W, 3]
+    constant float* img2,                  // gt       — [H, W, 3]
+    constant float* blurred_grad_mu1,      // [H, W, 3]
+    constant float* blurred_grad_sigma1_sq,// [H, W, 3]
+    constant float* blurred_grad_sigma12,  // [H, W, 3]
+    device   float* dL_dout_img,           // [H, W, 3] — accumulated
+    uint2 pix [[thread_position_in_grid]]
+) {
+    uint W = img_size.x;
+    uint H = img_size.y;
+    if (pix.x >= W || pix.y >= H) return;
+    uint base = (pix.y * W + pix.x) * 3u;
+
+    for (uint c = 0u; c < 3u; ++c) {
+        float a = img1[base + c];
+        float b = img2[base + c];
+        float gm1 = blurred_grad_mu1      [base + c];
+        float gs1 = blurred_grad_sigma1_sq[base + c];
+        float g12 = blurred_grad_sigma12  [base + c];
+
+        // Sum the three paths' contributions to dL/dimg1.
+        float contrib = gm1 + 2.0f * a * gs1 + b * g12;
+        dL_dout_img[base + c] += contrib;
+    }
 }
 // Single-dispatch inclusive prefix sum (cumsum) for int32 arrays.
 // Uses one threadgroup: each thread serially sums its chunk, thread 0 scans

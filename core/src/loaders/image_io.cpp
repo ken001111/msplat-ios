@@ -54,6 +54,29 @@ Image imreadRGB(const std::string &path) {
     return img;
 }
 
+// Read just image dimensions without decoding pixels. Used by loaders that
+// need to derive intrinsics when transforms.json doesn't carry w/h (NeRF
+// camera_angle_x format).
+bool imreadDimensions(const std::string &path, int &w, int &h) {
+    CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
+    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
+    CFRelease(cfPath);
+    CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
+    CFRelease(url);
+    if (!source) return false;
+    CFDictionaryRef props = CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr);
+    CFRelease(source);
+    if (!props) return false;
+    auto getInt = [&](CFStringRef key, int &out) {
+        CFNumberRef num = (CFNumberRef)CFDictionaryGetValue(props, key);
+        if (!num) return false;
+        return (bool)CFNumberGetValue(num, kCFNumberIntType, &out);
+    };
+    bool ok = getInt(kCGImagePropertyPixelWidth, w) && getInt(kCGImagePropertyPixelHeight, h);
+    CFRelease(props);
+    return ok;
+}
+
 // ── Image writing (CoreGraphics PNG) ─────────────────────────────────────────
 
 void imwriteRGB(const std::string &path, const Image &img) {

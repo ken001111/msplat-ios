@@ -18,6 +18,7 @@ Points readColmapPoints(const std::string &path);
 
 // Image I/O
 Image imreadRGB(const std::string &path);       // returns float32 [0,1] directly
+bool imreadDimensions(const std::string &path, int &w, int &h);  // pixel dims only, no decode
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 
@@ -33,6 +34,14 @@ UndistortResult undistortImage(const Image &src,
 
 // Pose utilities
 void autoScaleAndCenter(InputData &data);
+
+// Colab face-centered transform: matches notebook cell 2.
+// Places the assumed face point (faceDistance meters in front of camera 0,
+// along its -Z axis in OpenGL convention) at world origin, then scales the
+// world by scaleFactor. This puts the face at a known scale where 2DGS init
+// + densify behave consistently (Colab uses faceDistance=0.4, scale=10).
+// Run INSTEAD of autoScaleAndCenter, not in addition.
+void faceCenteredTransform(InputData &data, float faceDistance, float scaleFactor);
 
 // Gaussian PLY/splat I/O (trained scene export/import)
 struct GaussianParams {

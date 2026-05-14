@@ -137,6 +137,13 @@ struct MetalContext {
     id<MTLComputePipelineState> project_and_sh_backward_2dgs_kernel_cpso;
     // 2DGS training losses (M2.4)
     id<MTLComputePipelineState> loss_l1_distortion_2dgs_kernel_cpso;
+    // DSSIM (M2.7 — Colab parity): forward blur + compute + analytic backward.
+    id<MTLComputePipelineState> ssim_prep_products_kernel_cpso;
+    id<MTLComputePipelineState> ssim_blur_horiz_kernel_cpso;
+    id<MTLComputePipelineState> ssim_blur_vert_kernel_cpso;
+    id<MTLComputePipelineState> ssim_compute_kernel_cpso;
+    id<MTLComputePipelineState> ssim_backward_compute_kernel_cpso;
+    id<MTLComputePipelineState> ssim_backward_accumulate_kernel_cpso;
     // TSDF fusion (Phase 2c.2)
     id<MTLComputePipelineState> tsdf_integrate_kernel_cpso;
     // Marching Cubes (Phase 2c.3)
@@ -236,6 +243,13 @@ MetalContext* init_msplat_metal_context() {
     ctx->project_and_sh_backward_2dgs_kernel_cpso = load(@"project_and_sh_backward_2dgs_kernel");
     // 2DGS training losses (M2.4).
     ctx->loss_l1_distortion_2dgs_kernel_cpso      = load(@"loss_l1_distortion_2dgs_kernel");
+    // DSSIM stages (M2.7).
+    ctx->ssim_prep_products_kernel_cpso           = load(@"ssim_prep_products_kernel");
+    ctx->ssim_blur_horiz_kernel_cpso              = load(@"ssim_blur_horiz_kernel");
+    ctx->ssim_blur_vert_kernel_cpso               = load(@"ssim_blur_vert_kernel");
+    ctx->ssim_compute_kernel_cpso                 = load(@"ssim_compute_kernel");
+    ctx->ssim_backward_compute_kernel_cpso        = load(@"ssim_backward_compute_kernel");
+    ctx->ssim_backward_accumulate_kernel_cpso     = load(@"ssim_backward_accumulate_kernel");
     // TSDF fusion (Phase 2c.2).
     ctx->tsdf_integrate_kernel_cpso               = load(@"tsdf_integrate_kernel");
     // Marching Cubes (Phase 2c.3).
@@ -379,6 +393,31 @@ struct FusedTensorCache {
     MTensor dL_dout_distortion;   // [H, W]
     MTensor loss_sum;             // [1] scalar reduction
 
+    // M2.7 DSSIM intermediates. All [H, W, 3] except ssim_sum [1]. Image-size-keyed.
+    // Forward: product tensors (img1*img1, img2*img2, img1*img2) → blurred via
+    // separable 1D Gaussian (horizontal tmp → vertical final) → mu1, mu2,
+    // blur_img1_sq, blur_img2_sq, blur_img1_img2. ssim_compute reads all
+    // five blurred buffers + writes ssim_map + atomic-sums ssim_sum.
+    // Backward reuses the SAME tmp slots: grad_mu1, grad_sigma1_sq,
+    // grad_sigma12 each go through horiz+vert re-blur. We allocate enough
+    // tmp slots to chain the three backward blurs in parallel-safe order.
+    MTensor ssim_img1_sq, ssim_img2_sq, ssim_img1_img2;          // products [H,W,3]
+    MTensor ssim_mu1, ssim_mu2;                                  // blurred img1/img2
+    MTensor ssim_blur_img1_sq, ssim_blur_img2_sq;                // blurred products
+    MTensor ssim_blur_img1_img2;
+    MTensor ssim_blur_h_tmp_a, ssim_blur_h_tmp_b;                // horizontal-pass scratch
+    MTensor ssim_blur_h_tmp_c;                                   // third scratch (backward)
+    MTensor ssim_sum;                                            // [1] scalar
+    // Backward per-pixel grad buffers (compute step writes these; then
+    // re-blurred into the same destinations to save memory? simpler to
+    // keep separate buffers).
+    MTensor ssim_grad_mu1, ssim_grad_mu2;
+    MTensor ssim_grad_sigma1_sq, ssim_grad_sigma2_sq, ssim_grad_sigma12;
+    // Blurred versions of grad_mu1, grad_sigma1_sq, grad_sigma12 (the three
+    // paths that feed dL/dimg1). grad_mu2 and grad_sigma2_sq are dead-ends
+    // since img2 = gt is fixed.
+    MTensor ssim_blurred_grad_mu1, ssim_blurred_grad_sigma1_sq, ssim_blurred_grad_sigma12;
+
     // Tile-local sorting buffers (shared with densify)
     MTensor tile_bins;
     MTensor tile_offsets, tile_scatter_counters;
@@ -445,6 +484,28 @@ struct FusedTensorCache {
             dL_dout_normal = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             dL_dout_median_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
             dL_dout_distortion = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            // M2.7 DSSIM intermediates. All [H, W, 3] persistent buffers — re-zeroed
+            // implicitly by their producer kernels each iter (every output pixel is
+            // overwritten in the blur / compute / accumulate kernels, no atomics).
+            ssim_img1_sq        = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_img2_sq        = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_img1_img2      = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_mu1            = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_mu2            = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blur_img1_sq   = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blur_img2_sq   = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blur_img1_img2 = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blur_h_tmp_a   = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blur_h_tmp_b   = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blur_h_tmp_c   = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_grad_mu1       = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_grad_mu2       = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_grad_sigma1_sq = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_grad_sigma2_sq = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_grad_sigma12   = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blurred_grad_mu1       = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blurred_grad_sigma1_sq = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            ssim_blurred_grad_sigma12   = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
@@ -458,6 +519,9 @@ struct FusedTensorCache {
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
+        }
+        if (!ssim_sum.defined()) {
+            ssim_sum = mtensor_empty(dev, {1}, DType::Float32);
         }
     }
 
@@ -850,6 +914,17 @@ MTensor msplat_last_dL_dfeatures_dc()   { return g_tcache.dL_dfeatures_dc; }
 MTensor msplat_last_dL_dfeatures_rest() { return g_tcache.dL_dfeatures_rest; }
 MTensor msplat_last_dL_dmean2D()        { return g_tcache.dL_dmean2D; }
 MTensor msplat_last_radii()             { return g_tcache.radii_out; }
+// Diagnostic-only: pre-SH-chain colors gradient + raw transMat gradient.
+MTensor msplat_last_dL_dcolors()        { return g_tcache.dL_dcolors; }
+MTensor msplat_last_dL_dtransMat()      { return g_tcache.dL_dtransMat; }
+MTensor msplat_last_dL_dnormal3D()      { return g_tcache.dL_dnormal3D; }
+MTensor msplat_last_out_img()           { return g_tcache.out_img; }
+MTensor msplat_last_dL_dout_img()       { return g_tcache.dL_dout_img; }
+MTensor msplat_last_final_idx()         { return g_tcache.final_idx; }
+MTensor msplat_last_final_Ts()          { return g_tcache.final_Ts; }
+MTensor msplat_last_xys()                { return g_tcache.xys; }
+MTensor msplat_last_depths()             { return g_tcache.depths; }
+MTensor msplat_last_num_tiles_hit()      { return g_tcache.num_tiles_hit; }
 
 // ============================================================================
 // M2.5: 2DGS training step (forward + loss + backward, no Adam).
@@ -867,7 +942,11 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, int features_rest_bases,
-    float lambda_l1, float lambda_dist
+    float lambda_l1, float lambda_dist, float lambda_dssim,
+    MTensor &xys_grad_norm,
+    MTensor &vis_counts,
+    MTensor &max_2d_size,
+    float inv_max_dim
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -991,17 +1070,145 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
         [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
     };
 
+    // M2.7 DSSIM forward chain. Computes the SSIM map and accumulates its
+    // sum (over H*W*3 entries) into g_tcache.ssim_sum, so the loss kernel
+    // can fold (1 - mean(ssim)) into the scalar loss with one extra scalar.
+    // Five separable blurs (img1, img2, img1², img2², img1*img2) → ssim_compute.
+    auto encode_ssim_fwd = [&](id<MTLComputeCommandEncoder> enc) {
+        MTLSize dim = MTLSizeMake(img_width, img_height, 1);
+        MTLSize tg  = MTLSizeMake(16, 16, 1);
+
+        // 1. Build product tensors img1², img2², img1*img2.
+        [enc setComputePipelineState:ctx->ssim_prep_products_kernel_cpso];
+        [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+        ENC_BUF(enc, out_img, 1); ENC_BUF(enc, gt, 2);
+        ENC_BUF(enc, g_tcache.ssim_img1_sq, 3);
+        ENC_BUF(enc, g_tcache.ssim_img2_sq, 4);
+        ENC_BUF(enc, g_tcache.ssim_img1_img2, 5);
+        [enc dispatchThreads:dim threadsPerThreadgroup:tg];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // 2. Separable 1D Gaussian blur, one per source. Horizontal pass
+        //    writes to a tmp; vertical pass reads tmp and writes the final
+        //    blurred buffer. We reuse two tmps: tmp_a (img1, img1², img1*img2),
+        //    tmp_b (img2, img2²). The blurs are independent so we could
+        //    parallelize, but the barrier-between-pass requirement means
+        //    serializing on the tmp keeps the code simple.
+        auto do_blur = [&](MTensor &src, MTensor &dst, MTensor &tmp) {
+            [enc setComputePipelineState:ctx->ssim_blur_horiz_kernel_cpso];
+            [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+            ENC_BUF(enc, src, 1); ENC_BUF(enc, tmp, 2);
+            [enc dispatchThreads:dim threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [enc setComputePipelineState:ctx->ssim_blur_vert_kernel_cpso];
+            [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+            ENC_BUF(enc, tmp, 1); ENC_BUF(enc, dst, 2);
+            [enc dispatchThreads:dim threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        };
+        do_blur(out_img, g_tcache.ssim_mu1, g_tcache.ssim_blur_h_tmp_a);
+        do_blur(gt, g_tcache.ssim_mu2, g_tcache.ssim_blur_h_tmp_b);
+        do_blur(g_tcache.ssim_img1_sq,   g_tcache.ssim_blur_img1_sq,   g_tcache.ssim_blur_h_tmp_a);
+        do_blur(g_tcache.ssim_img2_sq,   g_tcache.ssim_blur_img2_sq,   g_tcache.ssim_blur_h_tmp_b);
+        do_blur(g_tcache.ssim_img1_img2, g_tcache.ssim_blur_img1_img2, g_tcache.ssim_blur_h_tmp_a);
+
+        // 3. Compute SSIM map and atomic-sum into ssim_sum.
+        [enc setComputePipelineState:ctx->ssim_compute_kernel_cpso];
+        [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+        ENC_BUF(enc, g_tcache.ssim_mu1, 1);
+        ENC_BUF(enc, g_tcache.ssim_mu2, 2);
+        ENC_BUF(enc, g_tcache.ssim_blur_img1_sq, 3);
+        ENC_BUF(enc, g_tcache.ssim_blur_img2_sq, 4);
+        ENC_BUF(enc, g_tcache.ssim_blur_img1_img2, 5);
+        // ssim_map is not strictly needed past this dispatch (we only use the
+        // forward blurred buffers in backward, since AB/CD recomputes are
+        // cheap). Still allocate-write it for debugging / future use.
+        // We reuse ssim_grad_mu2 slot as a scratch ssim_map buffer to avoid
+        // an extra allocation — neither needs to coexist with the backward
+        // compute output. Actually, we'll just not bind a map output; the
+        // compute kernel signature requires it though. Pass the unused
+        // ssim_grad_mu2 buffer — it gets overwritten by the backward kernel.
+        ENC_BUF(enc, g_tcache.ssim_grad_mu2, 6);  // doubles as ssim_map scratch
+        ENC_BUF(enc, g_tcache.ssim_sum, 7);
+        [enc dispatchThreads:dim threadsPerThreadgroup:tg];
+    };
+
     auto encode_loss = [&](id<MTLComputeCommandEncoder> enc) {
         [enc setComputePipelineState:ctx->loss_l1_distortion_2dgs_kernel_cpso];
         [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
         ENC_SCALAR(enc, inv_num_pixels, 1);
         ENC_SCALAR(enc, lambda_l1, 2); ENC_SCALAR(enc, lambda_dist, 3);
-        ENC_BUF(enc, out_img, 4); ENC_BUF(enc, gt, 5);
-        ENC_BUF(enc, g_tcache.out_distortion, 6);
-        ENC_BUF(enc, g_tcache.dL_dout_img, 7);
-        ENC_BUF(enc, g_tcache.dL_dout_distortion, 8);
-        ENC_BUF(enc, g_tcache.loss_sum, 9);
+        ENC_SCALAR(enc, lambda_dssim, 4);
+        ENC_BUF(enc, out_img, 5); ENC_BUF(enc, gt, 6);
+        ENC_BUF(enc, g_tcache.out_distortion, 7);
+        ENC_BUF(enc, g_tcache.ssim_sum, 8);
+        ENC_BUF(enc, g_tcache.dL_dout_img, 9);
+        ENC_BUF(enc, g_tcache.dL_dout_distortion, 10);
+        ENC_BUF(enc, g_tcache.loss_sum, 11);
         [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    };
+
+    // M2.7 DSSIM backward chain. dL/dssim_map is uniform across pixels:
+    //   dL/dssim_map[i,j,c] = -lambda_dssim * inv_num_pixels
+    // (loss = lambda_dssim * (1 - mean(ssim_map)) → derivative wrt each entry
+    // is -lambda_dssim/N where N = H*W*3.) We pass that as a scalar uniform
+    // to ssim_backward_compute_kernel, which produces five per-pixel grad
+    // buffers (already multiplied by the upstream scalar). Then we re-blur
+    // the three relevant ones (grad_mu1, grad_sigma1_sq, grad_sigma12) and
+    // chain-rule through (img1, img1², img1*img2) into dL_dout_img.
+    auto encode_ssim_bwd = [&](id<MTLComputeCommandEncoder> enc) {
+        MTLSize dim = MTLSizeMake(img_width, img_height, 1);
+        MTLSize tg  = MTLSizeMake(16, 16, 1);
+        float dL_dssim_uniform = -lambda_dssim * inv_num_pixels;
+
+        // 1. Per-pixel SSIM analytic backward → five grad buffers.
+        [enc setComputePipelineState:ctx->ssim_backward_compute_kernel_cpso];
+        [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+        ENC_SCALAR(enc, dL_dssim_uniform, 1);
+        ENC_BUF(enc, g_tcache.ssim_mu1, 2);
+        ENC_BUF(enc, g_tcache.ssim_mu2, 3);
+        ENC_BUF(enc, g_tcache.ssim_blur_img1_sq, 4);
+        ENC_BUF(enc, g_tcache.ssim_blur_img2_sq, 5);
+        ENC_BUF(enc, g_tcache.ssim_blur_img1_img2, 6);
+        ENC_BUF(enc, g_tcache.ssim_grad_mu1, 7);
+        ENC_BUF(enc, g_tcache.ssim_grad_mu2, 8);   // unused downstream (img2 fixed)
+        ENC_BUF(enc, g_tcache.ssim_grad_sigma1_sq, 9);
+        ENC_BUF(enc, g_tcache.ssim_grad_sigma2_sq, 10); // unused downstream
+        ENC_BUF(enc, g_tcache.ssim_grad_sigma12, 11);
+        [enc dispatchThreads:dim threadsPerThreadgroup:tg];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // 2. Re-blur grad_mu1, grad_sigma1_sq, grad_sigma12 through the
+        //    Gaussian. Since the Gaussian is symmetric, the adjoint of conv
+        //    is the same conv (input-side grad = conv(output-side grad, w)).
+        auto do_blur = [&](MTensor &src, MTensor &dst, MTensor &tmp) {
+            [enc setComputePipelineState:ctx->ssim_blur_horiz_kernel_cpso];
+            [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+            ENC_BUF(enc, src, 1); ENC_BUF(enc, tmp, 2);
+            [enc dispatchThreads:dim threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [enc setComputePipelineState:ctx->ssim_blur_vert_kernel_cpso];
+            [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+            ENC_BUF(enc, tmp, 1); ENC_BUF(enc, dst, 2);
+            [enc dispatchThreads:dim threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        };
+        do_blur(g_tcache.ssim_grad_mu1,       g_tcache.ssim_blurred_grad_mu1,       g_tcache.ssim_blur_h_tmp_a);
+        do_blur(g_tcache.ssim_grad_sigma1_sq, g_tcache.ssim_blurred_grad_sigma1_sq, g_tcache.ssim_blur_h_tmp_b);
+        do_blur(g_tcache.ssim_grad_sigma12,   g_tcache.ssim_blurred_grad_sigma12,   g_tcache.ssim_blur_h_tmp_c);
+
+        // 3. Chain-rule the three paths into dL_dout_img (additive: the L1
+        //    contribution is already there from encode_loss).
+        [enc setComputePipelineState:ctx->ssim_backward_accumulate_kernel_cpso];
+        [enc setBytes:img_size_dim2->data() length:sizeof(*img_size_dim2) atIndex:0];
+        ENC_BUF(enc, out_img, 1); ENC_BUF(enc, gt, 2);
+        ENC_BUF(enc, g_tcache.ssim_blurred_grad_mu1, 3);
+        ENC_BUF(enc, g_tcache.ssim_blurred_grad_sigma1_sq, 4);
+        ENC_BUF(enc, g_tcache.ssim_blurred_grad_sigma12, 5);
+        ENC_BUF(enc, g_tcache.dL_dout_img, 6);
+        [enc dispatchThreads:dim threadsPerThreadgroup:tg];
     };
 
     auto encode_rast_bwd_2dgs = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1046,12 +1253,22 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
         ENC_BUF(enc, g_tcache.dL_dcolors, 12);
         ENC_SCALAR(enc, degree, 13); ENC_SCALAR(enc, degrees_to_use, 14);
         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:15];
-        ENC_BUF(enc, g_tcache.dL_dmean3D, 16);
-        ENC_BUF(enc, g_tcache.dL_dscale, 17);
-        ENC_BUF(enc, g_tcache.dL_dquat, 18);
-        ENC_BUF(enc, g_tcache.dL_dmean2D, 19);
-        ENC_BUF(enc, g_tcache.dL_dfeatures_dc, 20);
-        ENC_BUF(enc, g_tcache.dL_dfeatures_rest, 21);
+        // Bug 2 fix: SH backward needs the non-DC SH coefficients to compute
+        // dL/d(viewdir), which back-propagates to dL/d(mean3D).
+        ENC_BUF(enc, features_rest, 16);
+        uint32_t num_bases_total = (degree + 1u) * (degree + 1u);
+        ENC_SCALAR(enc, num_bases_total, 17);
+        ENC_BUF(enc, g_tcache.dL_dmean3D, 18);
+        ENC_BUF(enc, g_tcache.dL_dscale, 19);
+        ENC_BUF(enc, g_tcache.dL_dquat, 20);
+        ENC_BUF(enc, g_tcache.dL_dmean2D, 21);
+        ENC_BUF(enc, g_tcache.dL_dfeatures_dc, 22);
+        ENC_BUF(enc, g_tcache.dL_dfeatures_rest, 23);
+        // Densify gradient stats — populated per iter, consumed by msplat_densify.
+        ENC_BUF(enc, xys_grad_norm, 24);
+        ENC_BUF(enc, vis_counts, 25);
+        ENC_BUF(enc, max_2d_size, 26);
+        ENC_SCALAR(enc, inv_max_dim, 27);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
 
@@ -1065,6 +1282,8 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
             [blit fillBuffer:g_tcache.loss_sum.buffer() range:NSMakeRange(0, g_tcache.loss_sum.nbytes()) value:0];
+            // SSIM atomic-sum buffer — must start at 0 each iter.
+            [blit fillBuffer:g_tcache.ssim_sum.buffer() range:NSMakeRange(0, g_tcache.ssim_sum.nbytes()) value:0];
             // Per-gaussian gradient accumulators — zero before atomic scatter.
             [blit fillBuffer:g_tcache.dL_dtransMat.buffer() range:NSMakeRange(0, g_tcache.dL_dtransMat.nbytes()) value:0];
             [blit fillBuffer:g_tcache.dL_dmean2D.buffer()   range:NSMakeRange(0, g_tcache.dL_dmean2D.nbytes())   value:0];
@@ -1092,7 +1311,11 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_rast_fwd_2dgs(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_ssim_fwd(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_loss(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_ssim_bwd(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_rast_bwd_2dgs(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];

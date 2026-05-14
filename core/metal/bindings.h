@@ -56,7 +56,12 @@ std::tuple<MTensor, float> msplat_train_step_2dgs(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, int features_rest_bases,
-    float lambda_l1, float lambda_dist);
+    float lambda_l1, float lambda_dist, float lambda_dssim,
+    // Densify gradient stats (accumulated per-iter; host resets after densify):
+    MTensor &xys_grad_norm,
+    MTensor &vis_counts,
+    MTensor &max_2d_size,
+    float inv_max_dim);
 
 // Phase 2c.3: Marching Cubes on a TSDF voxel grid. Allocates output buffers
 // internally based on `maxTriangles`, dispatches the kernel, reads back the
@@ -107,6 +112,17 @@ MTensor msplat_last_dL_dfeatures_dc();
 MTensor msplat_last_dL_dfeatures_rest();
 MTensor msplat_last_dL_dmean2D();   // overwritten by project backward for densify stats
 MTensor msplat_last_radii();        // forward output (per-gaussian int)
+// Diagnostic accessors (intermediate buffers between rasterize_bwd and proj_bwd).
+MTensor msplat_last_dL_dcolors();    // [N, 3] — raw SH-output color gradient
+MTensor msplat_last_dL_dtransMat();  // [N, 9] — raw transMat gradient (slots 6,7 = depth row x,y)
+MTensor msplat_last_dL_dnormal3D();  // [N, 3] — world-space normal gradient
+MTensor msplat_last_out_img();       // [H, W, 3] — last rendered image
+MTensor msplat_last_dL_dout_img();   // [H, W, 3] — loss-stage gradient on out_img
+MTensor msplat_last_final_idx();     // [H, W, 2] int — (last_contributor, median_contributor) per pixel
+MTensor msplat_last_final_Ts();      // [H, W, 3] — (T_final, M1, M2) per pixel
+MTensor msplat_last_xys();           // [N, 2] — projected screen-space center
+MTensor msplat_last_depths();        // [N] — view-space z per gaussian
+MTensor msplat_last_num_tiles_hit(); // [N] int — tile area per gaussian
 
 // Render-only forward pass (no loss computation)
 // Returns: out_img (H, W, 3) as MTensor

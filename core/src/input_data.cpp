@@ -76,6 +76,39 @@ MTensor& Camera::getGPUImage(int downscaleFactor) {
 
 // ── Scale & center ──────────────────────────────────────────────────────────
 
+// Mirror of Rear_Camera_02_clean.ipynb cell 2 (face-centering + scale-up).
+// faceDistance = assumed camera-to-face distance in meters (default 0.4).
+// scaleFactor = world scale-up for 2DGS training stability (default 10).
+void faceCenteredTransform(InputData &data, float faceDistance, float scaleFactor) {
+    if (data.cameras.empty()) return;
+
+    // Use first camera's camToWorld to locate the face in world coords:
+    //   face_world = M0 · (0, 0, -faceDistance, 1)  (camera looks down -Z in OpenGL)
+    const float *M0 = data.cameras.front().camToWorld;
+    float fx_w = M0[2]  * (-faceDistance) + M0[3];
+    float fy_w = M0[6]  * (-faceDistance) + M0[7];
+    float fz_w = M0[10] * (-faceDistance) + M0[11];
+
+    data.translation[0] = fx_w;
+    data.translation[1] = fy_w;
+    data.translation[2] = fz_w;
+    data.scale = scaleFactor;
+
+    // (cam_pos - face_world) * scaleFactor for every camera.
+    for (auto &cam : data.cameras) {
+        cam.camToWorld[3]  = (cam.camToWorld[3]  - fx_w) * scaleFactor;
+        cam.camToWorld[7]  = (cam.camToWorld[7]  - fy_w) * scaleFactor;
+        cam.camToWorld[11] = (cam.camToWorld[11] - fz_w) * scaleFactor;
+    }
+
+    // Apply to point cloud (no-op when called before random init).
+    for (int64_t i = 0; i < data.points.count; i++) {
+        data.points.xyz[i*3+0] = (data.points.xyz[i*3+0] - fx_w) * scaleFactor;
+        data.points.xyz[i*3+1] = (data.points.xyz[i*3+1] - fy_w) * scaleFactor;
+        data.points.xyz[i*3+2] = (data.points.xyz[i*3+2] - fz_w) * scaleFactor;
+    }
+}
+
 void autoScaleAndCenter(InputData &data) {
     if (data.cameras.empty()) return;
 
@@ -314,6 +347,69 @@ void initializeRandomPoints(InputData &data, int64_t numPoints, float extent) {
     data.points.count = numPoints;
 }
 
+void initializeRandomPointsCameraAware(InputData &data, int64_t numPoints, float radiusFrac) {
+    // Bail to dumb init if there are no cameras to derive a bbox from.
+    if (data.cameras.empty()) {
+        initializeRandomPoints(data, numPoints, 1.3f);
+        return;
+    }
+
+    // Scene center is the WORLD ORIGIN regardless of camera distribution.
+    // Both face-centered preprocessing and autoScaleAndCenter put the scene
+    // at (0, 0, 0). Earlier this function used the *camera centroid* which
+    // for partial-orbit captures (like the dummyhead, where cameras only cover
+    // a forward-facing arc) is offset from the actual scene by 1-3 world
+    // units — every gaussian then starts on the wrong side of the cameras and
+    // training cannot recover the geometry in 5000 iters.
+    float center[3] = {0.0f, 0.0f, 0.0f};
+    float invN = 1.0f / (float)data.cameras.size();
+
+    // Scene radius proxy = mean camera-to-origin distance × radiusFrac. For
+    // face-centered preprocessing this is approximately scaleFactor·faceDistance·radiusFrac
+    // (= 10·0.4·0.35 ≈ 1.4), which neatly covers a ~14 cm scaled-face region.
+    float meanDist = 0.0f;
+    for (const auto &c : data.cameras) {
+        float dx = c.camToWorld[3];
+        float dy = c.camToWorld[7];
+        float dz = c.camToWorld[11];
+        meanDist += std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    meanDist *= invN;
+
+    float sceneRadius = std::max(meanDist * radiusFrac, 0.05f);
+
+    std::cerr << "msplat: random init from camera bbox — center=("
+              << center[0] << "," << center[1] << "," << center[2]
+              << ") radius=" << sceneRadius << " points=" << numPoints << "\n";
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> distGauss(0.0f, 1.0f);
+    std::uniform_real_distribution<float> distR(0.0f, 1.0f);
+    // Match hbb1 reference dataset_readers.py line 241: dark random init
+    // (SH coeffs ∈ [0, 1/255] before SH2RGB, ≈ uchar 0-1 after). Forces
+    // gaussians to fade in and learn the correct surfaces rather than
+    // saturating early with bright random colors that fit "any pixel"
+    // (which leads to local minima where pixel loss is low but geometry
+    // is wrong).
+    std::uniform_int_distribution<int> distRgb(0, 1);
+
+    // Reject-sampling-free spherical: gaussian direction × cuberoot(uniform) radius.
+    data.points.xyz.resize(numPoints * 3);
+    data.points.rgb.resize(numPoints * 3);
+    for (int64_t i = 0; i < numPoints; i++) {
+        float gx = distGauss(rng), gy = distGauss(rng), gz = distGauss(rng);
+        float invLen = 1.0f / std::sqrt(gx * gx + gy * gy + gz * gz + 1e-12f);
+        float r = sceneRadius * std::cbrt(distR(rng));
+        data.points.xyz[i*3+0] = center[0] + gx * invLen * r;
+        data.points.xyz[i*3+1] = center[1] + gy * invLen * r;
+        data.points.xyz[i*3+2] = center[2] + gz * invLen * r;
+        data.points.rgb[i*3+0] = (uint8_t)distRgb(rng);
+        data.points.rgb[i*3+1] = (uint8_t)distRgb(rng);
+        data.points.rgb[i*3+2] = (uint8_t)distRgb(rng);
+    }
+    data.points.count = numPoints;
+}
+
 // ── Format dispatcher ───────────────────────────────────────────────────────
 
 InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
@@ -332,9 +428,8 @@ InputData inputDataFromX(const std::string &path, const std::string &colmapImage
     }
 
     if (data.points.count == 0) {
-        std::cerr << "msplat: no SfM point cloud found, seeding 100k random points "
-                     "(matches 3DGS/2DGS default behavior)\n";
-        initializeRandomPoints(data);
+        std::cerr << "msplat: no SfM point cloud found, seeding camera-aware random init\n";
+        initializeRandomPointsCameraAware(data);
     }
 
     return data;

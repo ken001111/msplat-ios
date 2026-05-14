@@ -48,7 +48,11 @@ Model::Model(const InputData &inputData, int numCameras,
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
-      stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
+      // Match hbb1 2DGS reference (densify_until_iter = 15000 default). For
+      // 5k-iter face scans, the reference densifies throughout the whole run.
+      // Stopping early at maxSteps/2 (our previous default) cuts off geometry
+      // refinement during the second half and leaves loss plateaued.
+      stopSplitAt(maxSteps - 500), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
       maxSteps(maxSteps), keepCrs(keepCrs) {
 
@@ -238,7 +242,13 @@ void Model::afterTrain(int step){
 
     if (step % refineEvery == 0 && step > warmupLength){
         int resetInterval = resetAlphaEvery * refineEvery;
-        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
+        // Hard cap on splat count. Without this, 2DGS densify on random-init
+        // datasets compounds past buffer capacity around iter 5k–7k and the
+        // training collapses to N=0. 250k is plenty for face-scale meshes
+        // and bounds peak memory at ~3 GB during the ensureCapacity(3*N) hop.
+        constexpr int kMaxSplats = 250000;
+        bool capacityOk = num_active < kMaxSplats;
+        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery && capacityOk;
 
         if (doDensification){
             int numPointsBefore = num_active;
@@ -643,21 +653,16 @@ Model::VoxelGrid Model::makeVoxelGrid(const std::vector<Camera> &cameras,
                                        int memoryCapMB) const {
     if (cameras.empty()) throw std::runtime_error("makeVoxelGrid: no cameras");
 
-    // Camera centroid (translation component of camToWorld, row-major).
-    float center[3] = {0, 0, 0};
-    for (const auto &cam : cameras) {
-        center[0] += cam.camToWorld[3];
-        center[1] += cam.camToWorld[7];
-        center[2] += cam.camToWorld[11];
-    }
-    center[0] /= cameras.size();
-    center[1] /= cameras.size();
-    center[2] /= cameras.size();
-
+    // Center on world origin. Both preprocessing modes put the scene center
+    // there: face-centered preprocessing places the face at (0,0,0); the
+    // generic autoScaleAndCenter also recenters camera centroid (≈ scene
+    // center for orbit captures) at origin. Previously this used the camera
+    // centroid directly, which for face-centered data (face at origin,
+    // cameras orbiting at distance ~4) put the voxel grid OUTSIDE the face.
     VoxelGrid g;
-    g.origin[0] = center[0] - boundRadius;
-    g.origin[1] = center[1] - boundRadius;
-    g.origin[2] = center[2] - boundRadius;
+    g.origin[0] = -boundRadius;
+    g.origin[1] = -boundRadius;
+    g.origin[2] = -boundRadius;
     int dim = static_cast<int>(std::ceil(2.0f * boundRadius / voxelSize));
     g.dims[0] = g.dims[1] = g.dims[2] = dim;
     g.voxelSize = voxelSize;
@@ -729,7 +734,14 @@ void Model::integrateTSDF(VoxelGrid &grid, std::vector<Camera> &cameras,
         const uint32_t W = static_cast<uint32_t>(cam.width  / sf);
         const uint32_t H = static_cast<uint32_t>(cam.height / sf);
 
-        MTensor depthBuf = msplat_last_out_depth();
+        // For BOUNDED scenes (face scans) we prefer median depth (the depth
+        // where transmittance T crosses 0.5) over the alpha-weighted expected
+        // depth. Median depth is the actual front surface; expected depth
+        // averages across all contributing surfels and smears for splats that
+        // aren't yet flat. Matches reference 2DGS `depth_ratio=1` recommendation
+        // (gaussian_renderer/__init__.py line 141). Median depth is already
+        // surface-meaningful (no alpha-normalization needed).
+        MTensor depthBuf = msplat_last_out_median_depth();
         MTensor alphaBuf = msplat_last_out_alpha();
         msplat_tsdf_integrate(
             grid.data,
@@ -762,7 +774,10 @@ float Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight)
         max2DSize = gpu_zeros({numPoints}, DType::Float32);
     }
 
-    // Forward + loss + backward — produces per-gaussian gradients in g_tcache.
+    // Forward + loss + backward — produces per-gaussian gradients in g_tcache
+    // AND accumulates densify gradient stats (xysGradNorm, visCounts, max2DSize)
+    // that msplat_densify will consume in afterTrain.
+    float invMaxDim = 1.0f / static_cast<float>(std::max(s.width, s.height));
     auto [radii_out, loss_val] = msplat_train_step_2dgs(
         numPoints, means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat,
@@ -772,8 +787,14 @@ float Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight)
         featuresDc, featuresRest, opacities, backgroundColor,
         gt, (int)featuresRest.size(-2),
         1.0f - ssimWeight,   // lambda_l1
-        0.0f                 // lambda_dist: enable later when training is stable
-    );
+        // λ_dist (depth-distortion regularizer): disabled to match the Colab
+        // run (Loss=0.0442, distort=0.0000 in the training log). The reference
+        // 2DGS recipe also uses λ_dist=0 by default for the 5k-iter face
+        // scans. Enabling it produced wrong-shape meshes — the regularizer
+        // pulls surfels flat at the cost of geometric accuracy.
+        0.0f,
+        ssimWeight,          // lambda_dssim (DSSIM weight; default 0.2 — Colab parity)
+        xysGradNorm, visCounts, max2DSize, invMaxDim);
     radii = radii_out;
 
     // Adam: step each of 6 param groups with the gradients from g_tcache.

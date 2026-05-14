@@ -64,6 +64,14 @@ InputData inputDataFromX(const std::string &path, const std::string &colmapImage
 // frame, so extent ≈ 1.3 covers a scene normalized to camera-radius ≈ 1.
 void initializeRandomPoints(InputData &data, int64_t numPoints = 100000, float extent = 1.3f);
 
+// Camera-aware random init for the "no SfM point cloud" case. Matches the
+// hbb1 2DGS reference (dataset_readers.py line 236-242): 100k points
+// concentrated near the scene center, dark random colors (SH∈[0,1/255] post-
+// SH2RGB ≈ uchar 0-1). Without 100k seeds the bootstrap from random init
+// can't drag splats to the right 3D positions — the photometric loss
+// converges to a local minimum where pixels match but geometry is wrong.
+void initializeRandomPointsCameraAware(InputData &data, int64_t numPoints = 100000, float radiusFrac = 0.35f);
+
 // Apply per-frame foreground masks to already-loaded camera images, matching
 // the LiDAR-mask step in Facescan's Colab notebook. Background pixels (mask <
 // 0.5) become white. `dilationPx` is the radius (kernel = 2*r+1) of a max-
